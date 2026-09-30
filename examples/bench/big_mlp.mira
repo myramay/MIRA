@@ -1,0 +1,14 @@
+# A large MLP (~50M parameters) for benchmarking: big enough that the
+# Neural Engine's throughput outweighs its per-call dispatch overhead.
+
+fn layer(x: f32[B, N], w: f32[N, M], b: f32[M]) -> f32[B, M] {
+  return gelu(x @ w + b)
+}
+
+fn main(x: f32[512, 2048],
+        const w1: f32[2048, 4096], const b1: f32[4096],
+        const w2: f32[4096, 4096], const b2: f32[4096],
+        const w3: f32[4096, 4096], const b3: f32[4096],
+        const w4: f32[4096, 1024], const b4: f32[1024]) -> f32[512, 1024] {
+  return layer(layer(layer(layer(x, w1, b1), w2, b2), w3, b3), w4, b4)
+}

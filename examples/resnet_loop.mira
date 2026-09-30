@@ -1,0 +1,15 @@
+# A deep residual MLP built with a compile-time loop.
+# The `for` loop is unrolled at compile time: 8 residual blocks become one
+# straight-line graph that the NPU can schedule end to end.
+
+fn block(x: f32[B, D], w: f32[D, D], b: f32[D]) -> f32[B, D] {
+  return x + relu(x @ w + b) * 0.5
+}
+
+fn main(x: f32[256, 512], const w: f32[512, 512], const b: f32[512]) -> f32[256, 512] {
+  let h = x
+  for i in 0..8 {
+    h = block(h, w, b)
+  }
+  return h / (1 + 8 * 0.5)
+}

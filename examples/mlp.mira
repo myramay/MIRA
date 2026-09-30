@@ -1,0 +1,16 @@
+# A 3-layer MLP classifier (MNIST-sized).
+# `dense` is generic over shape symbols B, N, M: each call is specialized
+# to the concrete shapes it's called with.
+
+fn dense(x: f32[B, N], w: f32[N, M], b: f32[M]) -> f32[B, M] {
+  return x @ w + b
+}
+
+fn main(x: f32[64, 784],
+        const w1: f32[784, 512], const b1: f32[512],
+        const w2: f32[512, 256], const b2: f32[256],
+        const w3: f32[256, 10],  const b3: f32[10]) -> f32[64, 10] {
+  let h1 = relu(dense(x, w1, b1))
+  let h2 = relu(dense(h1, w2, b2))
+  return softmax(dense(h2, w3, b3), axis=1)
+}

@@ -1,0 +1,27 @@
+# One transformer encoder block: multi-head self-attention + MLP, pre-layernorm.
+# Shows compile-time int parameters (nh), computed shapes (D / nh),
+# reshape/transpose to split heads, batched matmuls, softmax, layernorm, gelu,
+# and residual connections.
+
+fn split_heads(x: f32[T, D], nh: int) -> f32[nh, T, D / nh] {
+  return transpose(reshape(x, [T, nh, D / nh]), perm=[1, 0, 2])
+}
+
+fn attention(x: f32[T, D], wq: f32[D, D], wk: f32[D, D], wv: f32[D, D], wo: f32[D, D], nh: int) -> f32[T, D] {
+  let q = split_heads(x @ wq, nh)                         # [nh, T, D/nh]
+  let k = split_heads(x @ wk, nh)
+  let v = split_heads(x @ wv, nh)
+  let scores = softmax(q @ transpose(k) / sqrt(D / nh))   # [nh, T, T]
+  let ctx = transpose(scores @ v, perm=[1, 0, 2])         # [T, nh, D/nh]
+  return reshape(ctx, [T, D]) @ wo
+}
+
+fn main(x: f32[128, 256],
+        const ln1_g: f32[256], const ln1_b: f32[256],
+        const wq: f32[256, 256], const wk: f32[256, 256], const wv: f32[256, 256], const wo: f32[256, 256],
+        const ln2_g: f32[256], const ln2_b: f32[256],
+        const w1: f32[256, 1024], const b1: f32[1024],
+        const w2: f32[1024, 256], const b2: f32[256]) -> f32[128, 256] {
+  let h = x + attention(layernorm(x, ln1_g, ln1_b), wq, wk, wv, wo, 4)
+  return h + gelu(layernorm(h, ln2_g, ln2_b) @ w1 + b1) @ w2 + b2
+}

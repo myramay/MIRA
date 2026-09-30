@@ -1,0 +1,10 @@
+# A program that uses ops no NPU backend supports (sort, cumprod).
+# The partitioner runs the matmuls on the accelerator and falls back to the CPU
+# for the rest, moving tensors across the boundary automatically.
+
+fn main(x: f32[256, 512], const w1: f32[512, 512], const w2: f32[512, 128]) -> f32[256, 128] {
+  let h = tanh(x @ w1)
+  let ranked = sort(h, axis=1)                        # CPU only
+  let growth = cumprod(1 + 0.05 * ranked, axis=1)     # CPU only
+  return tanh(growth @ w2)
+}
