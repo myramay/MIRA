@@ -1,4 +1,4 @@
-# Mira
+# MIRA
 
 [![tests](https://github.com/myramay/MIRA/actions/workflows/tests.yml/badge.svg)](https://github.com/myramay/MIRA/actions/workflows/tests.yml)
 
