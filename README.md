@@ -1,5 +1,7 @@
 # Mira
 
+[![tests](https://github.com/myramay/MIRA/actions/workflows/tests.yml/badge.svg)](https://github.com/myramay/MIRA/actions/workflows/tests.yml)
+
 A small tensor language and compiler that runs neural-network programs, both inference and training, on four targets:
 
 | target    | what it is                                                                              |
