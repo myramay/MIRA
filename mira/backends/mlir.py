@@ -33,6 +33,7 @@ GELU_K = 0.044715
 
 UNSUPPORTED = {"sort", "cumprod", "conv2d_grad_input", "conv2d_grad_weight", "maxpool2d_grad", "scatter_add"}
 I32_MAX, I32_MIN = 2**31 - 1, -2**31
+REDUCE_ALIGN = 32      # see Emitter.reduce
 F32_MATH = {"exp", "log", "sqrt", "tanh", "sigmoid", "gelu", "erf", "pow", "div"}   # computed in fp32 for fp16
 
 
@@ -170,6 +171,16 @@ class Emitter:
 
     def reduce(self, v: str, t: TensorType, axes: tuple[int, ...], kind: str) -> tuple[str, TensorType]:
         """linalg.reduce over `axes` (keepdims=False) with add, max or min."""
+        if kind in ("max", "min"):
+            # Workaround: on x86, IREE 3.11 vectorizes a max/min reduction whose length isn't a multiple
+            # of the vector width by padding the leftover lanes with 0 instead of the identity, so
+            # max([-7.9, -8.8, ...]) of 38 values comes out as -0. Padding the axis ourselves with
+            # -inf / +inf to a multiple of 32 leaves IREE nothing to pad. (Found by the fuzzer on CI.)
+            hi = [(-d) % REDUCE_ALIGN if i in axes and d > 1 else 0 for i, d in enumerate(t.shape)]
+            if any(hi):
+                padded = TensorType(t.dtype, tuple(d + h for d, h in zip(t.shape, hi)))
+                v = self.pad(v, t, padded, [0] * t.rank, hi, -np.inf if kind == "max" else np.inf)
+                t = padded
         out_t = TensorType(t.dtype, tuple(d for i, d in enumerate(t.shape) if i not in axes))
         init = self.fill(out_t, {"add": 0.0, "max": -np.inf, "min": np.inf}[kind])
         r = self.fresh()
@@ -209,9 +220,8 @@ class Emitter:
     def widened(self, inner, n_args: int):
         """Run an fp32 scalar body on fp16 values: extend the arguments, compute, round once at the end.
 
-        Matches the reference semantics (fp32 math, fp16 storage). It also matters for accuracy: on
-        x86, which has no native fp16 arithmetic, IREE's fp16 lowerings of tanh/exp/... lose far more
-        precision than computing in fp32 (the fuzzer found 6% error on GitHub's x86 runners).
+        Matches the reference semantics (fp32 math, rounded to fp16 once per op), and avoids
+        compounding fp16 rounding inside multi-step functions like gelu.
         """
         def body(a):
             lines, wide = [], []

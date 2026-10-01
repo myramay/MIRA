@@ -141,3 +141,15 @@ def test_coreml_survives_idle_cleanup():
     ])
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "survived" in r.stdout, r.stderr[-2000:]
+
+
+@pytest.mark.skipif(not HAS_IREE, reason="needs iree-base-compiler")
+@pytest.mark.parametrize("cols", [37, 38, 40])
+def test_mlir_max_of_all_negative_rows(cols):
+    """Regression: on x86, IREE padded leftover vector lanes of a max-reduction with 0, so the max of a
+    row of negatives whose length isn't a multiple of the vector width came out as 0 (found on CI)."""
+    src = f"fn main(x: f32[4, {cols}]) -> (f32[4], i32[4]) {{\n  return max(x, axis=1), argmax(x, axis=1)\n}}\n"
+    x = (np.random.default_rng(1).standard_normal((4, cols)) - 10).astype(np.float32)
+    m, am = mira.compile_source(src, "mlir", cost_model=False, precision=None).run({"x": x})
+    np.testing.assert_allclose(m, x.max(1), rtol=1e-6)
+    np.testing.assert_array_equal(am, x.argmax(1))
