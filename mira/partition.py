@@ -33,9 +33,14 @@ class Placement:
     reason: dict[ir.Op, str] = field(default_factory=dict)
 
 
+def is_heavy(op: ir.Op) -> bool:
+    """Worth an accelerator trip: big compute, or a loop/branch whose body has some."""
+    return op.kind in HEAVY_KINDS or any(is_heavy(inner) for _, sub in op.subgraphs() for inner in sub.ops)
+
+
 def _schedule(ops: list[ir.Op], device: dict[ir.Op, str]) -> list[tuple[str, list[ir.Op]]]:
     order = {op: i for i, op in enumerate(ops)}
-    producer = {op.result: op for op in ops}
+    producer = {r: op for op in ops for r in op.results}
     deps = {op: {producer[v] for v in op.inputs if v in producer} for op in ops}
     users: dict[ir.Op, list[ir.Op]] = {op: [] for op in ops}
     for op, ds in deps.items():
@@ -66,9 +71,12 @@ def partition(g: ir.Graph, target, cost_model: bool = True) -> tuple[list[Segmen
     compute = g.compute_ops()
     placement = Placement()
     for op in compute:
-        reason = target.check(op) if target.name != "cpu" else None
+        if op.is_control and not getattr(target, "supports_control_flow", False):
+            reason = "control flow runs on the host; its sub-graphs are compiled for the target separately"
+        else:
+            reason = target.check(op) if target.name != "cpu" else None
         placement.device[op] = "cpu" if reason else target.name
-        if reason:
+        if reason and target.name != "cpu":
             placement.reason[op] = reason
 
     while True:
@@ -76,7 +84,7 @@ def partition(g: ir.Graph, target, cost_model: bool = True) -> tuple[list[Segmen
         demoted = False
         if cost_model and target.name != "cpu":
             for dev, ops in groups:
-                if dev != "cpu" and not any(op.kind in HEAVY_KINDS for op in ops):
+                if dev != "cpu" and not any(is_heavy(op) for op in ops):
                     for op in ops:
                         placement.device[op] = "cpu"
                         placement.reason[op] = "kept on CPU: segment has no heavy compute, transfers would dominate"
@@ -84,11 +92,12 @@ def partition(g: ir.Graph, target, cost_model: bool = True) -> tuple[list[Segmen
         if not demoted:
             break
 
-    const_of = {op.result: op for op in g.ops if op.is_const}
+    const_of = {op.result: op for op in g.ops if op.is_constant_like}
     produced_in: dict[ir.Value, int] = {}
     for i, (_, ops) in enumerate(groups):
         for op in ops:
-            produced_in[op.result] = i
+            for r in op.results:
+                produced_in[r] = i
 
     segments: list[Segment] = []
     for i, (dev, ops) in enumerate(groups):
@@ -106,6 +115,6 @@ def partition(g: ir.Graph, target, cost_model: bool = True) -> tuple[list[Segmen
             if j != i:
                 for op in later:
                     needed_later.update(op.inputs)
-        outputs = [op.result for op in ops if op.result in needed_later]
+        outputs = [r for op in ops for r in op.results if r in needed_later]
         segments.append(Segment(dev, ir.Graph(f"{g.name}.seg{i}.{dev}", inputs, consts + ops, outputs)))
     return segments, placement

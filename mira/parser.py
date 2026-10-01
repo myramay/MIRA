@@ -3,21 +3,25 @@
 Grammar (EBNF):
 
     module   := { NEWLINE | fn }
-    fn       := "fn" IDENT "(" [ param { "," param } ] ")" "->" type block
+    fn       := "fn" IDENT "(" [ param { "," param } ] ")" "->" ( type | "(" type { "," type } ")" ) block
     param    := [ "const" ] IDENT ":" type  |  IDENT ":" "int"      (compile-time integer)
     type     := DTYPE "[" [ dim { "," dim } ] "]"
     dim      := expr            (an INT, a shape symbol IDENT, or arithmetic on them like H / 2)
     block    := "{" { NEWLINE | stmt } "}"
-    stmt     := "let" IDENT [ ":" type ] "=" expr
-              | IDENT "=" expr
+    stmt     := "let" names [ ":" type ] "=" expr
+              | names "=" expr
               | "for" IDENT "in" expr ".." expr block
-              | "return" expr
-    expr     := term { ("+" | "-") term }
+              | "if" expr block [ "else" ( block | if-stmt ) ]
+              | "while" expr block
+              | "return" expr { "," expr }
+    names    := IDENT { "," IDENT } | "(" IDENT { "," IDENT } ")"
+    expr     := sum [ ("<" | "<=" | ">" | ">=" | "==" | "!=") sum ]
+    sum      := term { ("+" | "-") term }
     term     := unary { ("*" | "/" | "@") unary }
     unary    := "-" unary | power
     power    := primary [ "**" unary ]            (right-associative, like Python)
     primary  := INT | FLOAT | "true" | "false" | DTYPE | IDENT [ "(" args ")" ]
-              | "(" expr ")" | "[" [ expr { "," expr } ] "]"
+              | "(" expr ")" | "(" expr "," [ expr { "," expr } ] ")" | "[" [ expr { "," expr } ] "]"
     args     := [ arg { "," arg } ]
     arg      := [ IDENT "=" ] expr
 """
@@ -56,7 +60,7 @@ class Parser:
         t = self.accept(kind, text)
         if t is None:
             wanted = what or (repr(text) if text else kind)
-            got = "end of line" if self.tok.kind == "newline" else "end of file" if self.tok.kind == "eof" else repr(self.tok.text)
+            got = {"newline": "end of line", "eof": "end of file"}.get(self.tok.kind, repr(self.tok.text))
             raise MiraError(f"expected {wanted}, found {got}", self.tok.loc)
         return t
 
@@ -97,10 +101,18 @@ class Parser:
                 if not self.accept("op", ","):
                     break
         self.expect("op", ")")
+        self.skip_newlines()              # allow the "-> ..." on its own line
         self.expect("op", "->", "'->' and a return type")
-        ret = self.type()
+        if self.accept("op", "("):          # tuple return: -> (f32[..], f32[..])
+            rets = [self.type()]
+            while self.accept("op", ","):
+                rets.append(self.type())
+            self.expect("op", ")")
+        else:
+            rets = [self.type()]
+        self.skip_newlines()
         body = self.block()
-        return S.FnDecl(name, params, ret, body, start.loc)
+        return S.FnDecl(name, params, rets, body, start.loc)
 
     def type(self) -> S.TypeExpr:
         t = self.expect("dtype", what="a tensor type like f16[8, 128]")
@@ -139,12 +151,22 @@ class Parser:
     def stmt(self) -> S.Stmt:
         t = self.tok
         if self.accept("kw", "let"):
-            name = self.expect("ident", what="variable name").text
-            ty = self.type() if self.accept("op", ":") else None
+            names = self.name_list("variable name")
+            ty = None
+            if self.accept("op", ":"):
+                if len(names) > 1:
+                    raise MiraError("type annotations aren't allowed when destructuring", self.tok.loc)
+                ty = self.type()
             self.expect("op", "=")
-            return S.Let(t.loc, name, ty, self.expr())
+            return S.Let(t.loc, names, ty, self.expr())
         if self.accept("kw", "return"):
-            return S.Return(t.loc, self.expr())
+            value = self.expr()
+            if self.at("op", ","):                 # return a, b
+                items = [value]
+                while self.accept("op", ","):
+                    items.append(self.expr())
+                value = S.TupleLit(value.loc, items)
+            return S.Return(t.loc, value)
         if self.accept("kw", "for"):
             var = self.expect("ident", what="loop variable").text
             self.expect("kw", "in", "'in'")
@@ -152,15 +174,54 @@ class Parser:
             self.expect("op", "..", "'..'")
             stop = self.expr()
             return S.For(t.loc, var, start, stop, self.block())
-        if self.at("ident") and self.peek().kind == "op" and self.peek().text == "=":
-            name = self.expect("ident").text
+        if self.accept("kw", "if"):
+            return self.if_rest(t)
+        if self.accept("kw", "while"):
+            cond = self.expr()
+            return S.While(t.loc, cond, self.block())
+        if self.at("ident") and self.peek().kind == "op" and self.peek().text in ("=", ","):
+            names = self.name_list("variable name")
             self.expect("op", "=")
-            return S.Assign(t.loc, name, self.expr())
-        raise MiraError(f"expected a statement (let, return, for, or assignment), found {t.text!r}", t.loc)
+            return S.Assign(t.loc, names, self.expr())
+        raise MiraError(f"expected a statement (let, return, for, if, while, or assignment), found {t.text!r}",
+                        t.loc)
+
+    def if_rest(self, t) -> S.If:
+        cond = self.expr()
+        then = self.block()
+        orelse: list[S.Stmt] = []
+        if self.accept("kw", "else"):
+            if (t2 := self.accept("kw", "if")) is not None:     # else if ...
+                orelse = [self.if_rest(t2)]
+            else:
+                orelse = self.block()
+        return S.If(t.loc, cond, then, orelse)
+
+    def name_list(self, what: str) -> list[str]:
+        """IDENT {, IDENT}  or  ( IDENT {, IDENT} )"""
+        paren = self.accept("op", "(") is not None
+        names = [self.expect("ident", what=what).text]
+        while self.accept("op", ","):
+            names.append(self.expect("ident", what=what).text)
+        if paren:
+            self.expect("op", ")")
+        if len(set(names)) != len(names):
+            raise MiraError("the same name appears twice", self.tok.loc)
+        return names
 
     # ----- expressions -----
 
     def expr(self) -> S.Expr:
+        lhs = self.sum()
+        if self.tok.kind == "op" and self.tok.text in S.COMPARE_OPS:
+            op = self.tok
+            self.pos += 1
+            lhs = S.Binary(op.loc, op.text, lhs, self.sum())
+            if self.tok.kind == "op" and self.tok.text in S.COMPARE_OPS:
+                raise MiraError("comparisons can't be chained; use parentheses", self.tok.loc)
+        return lhs
+
+    def sum(self) -> S.Expr:
         lhs = self.term()
         while self.at("op", "+") or self.at("op", "-"):
             op = self.tok
@@ -205,6 +266,15 @@ class Parser:
             return S.Name(t.loc, t.text)
         if self.accept("op", "("):
             e = self.expr()
+            if self.accept("op", ","):             # tuple literal (a, b)
+                items = [e]
+                if not self.at("op", ")"):
+                    while True:
+                        items.append(self.expr())
+                        if not self.accept("op", ","):
+                            break
+                self.expect("op", ")")
+                return S.TupleLit(t.loc, items)
             self.expect("op", ")")
             return e
         if self.accept("op", "["):

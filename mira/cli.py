@@ -14,10 +14,10 @@ import time
 import numpy as np
 
 from .backends import TARGETS
-from .compiler import CompiledProgram, compile_file
+from .compiler import CompiledProgram, DynamicProgram, compile_file
 from .errors import MiraError
 
-STAGES = ["tokens", "ast", "ir", "opt", "passes", "partition", "asm", "timeline"]
+STAGES = ["tokens", "ast", "ir", "opt", "passes", "partition", "asm", "timeline", "mlir"]
 
 
 def _dims(items: list[str]) -> dict[str, int]:
@@ -38,10 +38,21 @@ def _load_npz(path):
 
 
 def _compile(args, target: str) -> CompiledProgram:
-    return compile_file(args.file, target, entry=args.entry, weights=_load_npz(args.weights), dims=_dims(args.dim),
+    prog = compile_file(args.file, target, entry=args.entry, weights=_load_npz(args.weights), dims=_dims(args.dim),
                         seed=args.seed, optimize=not args.O0, fuse=not args.no_fuse, units=args.units,
                         double_buffer=not args.no_double_buffer, precision=args.precision,
-                        cost_model=not args.no_cost_model)
+                        cost_model=not args.no_cost_model, quantize=args.quantize, sim_fast=args.sim_fast,
+                        sim_config=dict(kv.split("=", 1) for kv in args.sim or []), mlir_backend=args.mlir_backend)
+    if isinstance(prog, DynamicProgram):
+        syms = sorted({d for p in prog.fn.params for d in p.type.dims if isinstance(d, str)}
+                      | {p.name for p in prog.fn.params if p.type.is_int} - set(_dims(args.dim)))
+        raise MiraError(f"the entry function has runtime dimensions ({', '.join(syms)}); "
+                        f"give them values with --dim, e.g. --dim {syms[0]}=8")
+    return prog
+
+
+def _as_tuple(out) -> tuple:
+    return out if isinstance(out, tuple) else (out,)
 
 
 def _inputs(prog: CompiledProgram, path, seed: int) -> dict[str, np.ndarray]:
@@ -58,22 +69,27 @@ def _sim_segments(prog: CompiledProgram):
 def cmd_run(args) -> int:
     prog = _compile(args, args.target)
     feeds = _inputs(prog, args.inputs, args.seed)
-    out = prog.run(feeds)
+    outs = _as_tuple(prog.run(feeds))
     print(prog.summary())
     total = sum(t for _, t in prog.last_timings)
-    print(f"output {list(out.shape)} {out.dtype}   wall time {total * 1e3:.2f} ms")
-    with np.printoptions(precision=4, suppress=True, threshold=12, edgeitems=3):
-        print(out)
+    print(f"wall time {total * 1e3:.2f} ms")
+    for i, out in enumerate(outs):
+        print(f"output {i}: {list(out.shape)} {out.dtype}")
+        with np.printoptions(precision=4, suppress=True, threshold=12, edgeitems=3):
+            print(out)
     if args.save:
-        np.save(args.save, out)
+        np.savez(args.save, *outs) if len(outs) > 1 else np.save(args.save, outs[0])
         print(f"saved to {args.save}")
     if args.check and args.target != "cpu":
-        ref = compile_file(args.file, "cpu", entry=args.entry, weights=_load_npz(args.weights),
-                           dims=_dims(args.dim), seed=args.seed).run(feeds)
-        err = float(np.abs(out.astype(np.float32) - ref.astype(np.float32)).max())
-        rel = err / (float(np.abs(ref).max()) + 1e-12)
-        ok = rel < args.tol
-        print(f"check vs cpu reference: max abs err {err:.3e}, relative {rel:.3e}  ->  {'PASS' if ok else 'FAIL'}")
+        refs = _as_tuple(compile_file(args.file, "cpu", entry=args.entry, weights=_load_npz(args.weights),
+                                      dims=_dims(args.dim), seed=args.seed).run(feeds))
+        ok = True
+        for i, (out, ref) in enumerate(zip(outs, refs)):
+            err = float(np.abs(out.astype(np.float32) - ref.astype(np.float32)).max())
+            rel = err / (float(np.abs(ref).max()) + 1e-12)
+            ok &= rel < args.tol
+            print(f"check output {i} vs cpu reference: max abs err {err:.3e}, relative {rel:.3e}  ->  "
+                  f"{'PASS' if rel < args.tol else 'FAIL'}")
         return 0 if ok else 1
     return 0
 
@@ -99,6 +115,12 @@ def cmd_emit(args) -> int:
     elif args.stage == "passes":
         for name, text in prog.pass_log:
             print(f"// ----- after {name}\n{text}\n")
+    elif args.stage == "mlir":
+        from .backends.mlir import emit_module, supported
+        bad = [f"{op.kind}: {r}" for op in prog.graph.compute_ops() if (r := supported(op))]
+        if bad:
+            raise MiraError("can't emit the whole program as MLIR: " + "; ".join(sorted(set(bad))))
+        print(emit_module(prog.graph), end="")
     elif args.stage == "partition":
         print(prog.placement_report())
         print()
@@ -130,10 +152,10 @@ def cmd_bench(args) -> int:
         prog = _compile(args, name)
         if feeds is None:
             feeds = _inputs(prog, args.inputs, args.seed)
-        out = prog.run(feeds)      # warm-up (and correctness)
+        out = _as_tuple(prog.run(feeds))[0]      # warm-up (and correctness, on the first output)
         if ref is None:
-            ref = compile_file(args.file, "cpu", entry=args.entry, weights=_load_npz(args.weights),
-                               dims=_dims(args.dim), seed=args.seed).run(feeds).astype(np.float32)
+            ref = _as_tuple(compile_file(args.file, "cpu", entry=args.entry, weights=_load_npz(args.weights),
+                                         dims=_dims(args.dim), seed=args.seed).run(feeds))[0].astype(np.float32)
         times = []
         for _ in range(args.iters):
             t0 = time.perf_counter()
@@ -163,7 +185,7 @@ def main(argv=None) -> int:
 
     def common(p):
         p.add_argument("file")
-        p.add_argument("--target", "-t", default="cpu", choices=TARGETS + ["sim", "ane"])
+        p.add_argument("--target", "-t", default="cpu", choices=TARGETS + ["sim", "ane", "iree"])
         p.add_argument("--entry", default="main")
         p.add_argument("--weights", help=".npz with values for const parameters (default: random)")
         p.add_argument("--inputs", help=".npz with runtime inputs (default: random)")
@@ -175,6 +197,12 @@ def main(argv=None) -> int:
         p.add_argument("--no-fuse", action="store_true")
         p.add_argument("--no-double-buffer", action="store_true")
         p.add_argument("--no-cost-model", action="store_true", help="offload every supported op")
+        p.add_argument("--quantize", choices=["int8"], help="store large weights as int8 (per-channel scales)")
+        p.add_argument("--sim-fast", action="store_true", help="npu-sim: timing only (outputs from the reference)")
+        p.add_argument("--mlir-backend", default="cpu", choices=["cpu", "metal"],
+                       help="mlir target: compile with IREE for the CPU or the Mac GPU (Metal)")
+        p.add_argument("--sim", action="append", metavar="KEY=VALUE",
+                       help="npu-sim hardware parameter, e.g. --sim mxu_dim=64 --sim sram_bytes=1048576")
 
     p = sub.add_parser("run", help="compile and run")
     common(p)
@@ -202,6 +230,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.target in ("sim", "ane"):
         args.target = {"sim": "npu-sim", "ane": "coreml"}[args.target]
+    if args.target == "iree":
+        args.target = "mlir"
     if args.precision == "none":
         args.precision = None
     try:

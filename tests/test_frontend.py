@@ -137,7 +137,8 @@ def test_entry_dims_from_caller():
     p = mira.compile_source(src, dims={"B": 7})
     assert p.graph.inputs[0].type.shape == (7, 4)
     with pytest.raises(mira.MiraError, match="dimension 'B' of the entry function"):
-        mira.compile_source(src)
+        mira.compile_source(src, dynamic=False)
+    assert isinstance(mira.compile_source(src), mira.DynamicProgram)
 
 
 def test_weights_are_baked_in_as_constants():

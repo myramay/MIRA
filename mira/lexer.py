@@ -9,11 +9,12 @@ from dataclasses import dataclass
 
 from .errors import Loc, MiraError
 
-KEYWORDS = {"fn", "let", "return", "for", "in", "const", "true", "false"}
+KEYWORDS = {"fn", "let", "return", "for", "in", "const", "true", "false", "if", "else", "while"}
 DTYPES = {"f16", "f32"}
 
 # Longest operators first so "->" wins over "-" and ".." over ".".
-OPERATORS = ["->", "..", "**", "+", "-", "*", "/", "@", "=", ":", ",", "(", ")", "[", "]", "{", "}"]
+OPERATORS = ["->", "..", "**", "<=", ">=", "==", "!=", "<", ">",
+             "+", "-", "*", "/", "@", "=", ":", ",", "(", ")", "[", "]", "{", "}"]
 
 
 @dataclass(frozen=True)

@@ -8,8 +8,12 @@ where each op was actually placed, and map that back to our IR ops.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import logging
 import os
+import sys
+import tempfile
 import warnings
 from typing import Optional
 
@@ -18,14 +22,49 @@ import numpy as np
 from .. import ir
 
 _UNARY = {"relu": "relu", "sigmoid": "sigmoid", "tanh": "tanh", "exp": "exp", "log": "log", "sqrt": "sqrt",
-          "abs": "abs"}
+          "abs": "abs", "sign": "sign"}
+_COMPARE = {"greater": "greater", "greater_equal": "greater_equal", "equal": "equal"}
 _BINARY = {"add": "add", "sub": "sub", "mul": "mul", "div": "real_div", "pow": "pow",
            "maximum": "maximum", "minimum": "minimum"}
 _REDUCE = {"reduce_sum": "reduce_sum", "reduce_mean": "reduce_mean", "reduce_max": "reduce_max"}
-SUPPORTED = set(_UNARY) | set(_BINARY) | set(_REDUCE) | {
-    "neg", "gelu", "matmul", "conv2d", "maxpool2d", "softmax", "transpose", "reshape", "concat", "layernorm", "cast"}
+SUPPORTED = set(_UNARY) | set(_BINARY) | set(_REDUCE) | set(_COMPARE) | {
+    "neg", "gelu", "matmul", "conv2d", "maxpool2d", "softmax", "transpose", "reshape", "concat", "layernorm", "cast",
+    "where", "broadcast", "slice", "pad", "dequantize"}
 
 COMPUTE_UNITS = {"ne": "CPU_AND_NE", "all": "ALL", "gpu": "CPU_AND_GPU", "cpu": "CPU_ONLY"}
+
+
+_libc = ctypes.CDLL(None)
+
+
+@contextlib.contextmanager
+def capture_native_output(sink: list[str]):
+    """Capture what Core ML's native code prints (fds 1 and 2), e.g. ANE compiler failures.
+
+    The C library buffers stdout, so we fflush() it before restoring the descriptors;
+    otherwise the text would only appear when the process exits.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = {fd: os.dup(fd) for fd in (1, 2)}
+    with tempfile.TemporaryFile(mode="w+b") as tmp:
+        for fd in saved:
+            os.dup2(tmp.fileno(), fd)
+        try:
+            yield
+        finally:
+            _libc.fflush(None)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for fd, orig in saved.items():
+                os.dup2(orig, fd)
+                os.close(orig)
+            tmp.seek(0)
+            text = tmp.read().decode(errors="replace").replace("E5RT encountered", "\nE5RT encountered")
+            sink.extend(line for line in text.splitlines() if line.strip())
+
+
+ANE_FAILURE = "ANECCompile() FAILED"
 
 
 def _quiet():
@@ -70,11 +109,14 @@ class CoreMLExecutable:
 
         precision = ct.precision.FLOAT16 if all(op.result.type.dtype == "f16" for op in g.compute_ops()) \
             else ct.precision.FLOAT32
-        self.model = ct.convert(prog, convert_to="mlprogram",
-                                compute_units=getattr(ct.ComputeUnit, COMPUTE_UNITS[units]),
-                                minimum_deployment_target=ct.target.macOS15,
-                                compute_precision=precision)
-        self.placement = self._compute_plan(ct)
+        self.native_log: list[str] = []
+        with capture_native_output(self.native_log):
+            self.model = ct.convert(prog, convert_to="mlprogram",
+                                    compute_units=getattr(ct.ComputeUnit, COMPUTE_UNITS[units]),
+                                    minimum_deployment_target=ct.target.macOS15,
+                                    compute_precision=precision)
+            self.placement = self._compute_plan(ct)
+        self.warmed_up = False
 
     # ----- IR op -> MIL ops
 
@@ -90,6 +132,29 @@ class CoreMLExecutable:
             return mb.gelu(x=x[0], mode="TANH_APPROXIMATION", name=name)
         if k in _BINARY:
             return getattr(mb, _BINARY[k])(x=x[0], y=x[1], name=name)
+        mil_dt = {"f16": "fp16", "f32": "fp32"}[op.result.type.dtype]
+        if k in _COMPARE:     # MIL comparisons return bool; Mira's are 1.0 / 0.0
+            return mb.cast(x=getattr(mb, _COMPARE[k])(x=x[0], y=x[1]), dtype=mil_dt, name=name)
+        if k == "where":
+            cond = mb.not_equal(x=x[0], y=np_dt(0))
+            return mb.select(cond=cond, a=x[1], b=x[2], name=name)
+        if k == "broadcast":
+            shape = tuple(a["shape"])
+            src = op.inputs[0].type.shape
+            if len(src) < len(shape):
+                src = (1,) * (len(shape) - len(src)) + src
+                x0 = mb.reshape(x=x[0], shape=list(src))
+            else:
+                x0 = x[0]
+            return mb.tile(x=x0, reps=[t // s for s, t in zip(src, shape)], name=name)
+        if k == "slice":
+            return mb.slice_by_size(x=x[0], begin=list(a["begin"]), size=list(a["size"]), name=name)
+        if k == "pad":
+            flat = [n for pair in a["pads"] for n in pair]
+            return mb.pad(x=x[0], pad=flat, mode="constant", constant_val=np_dt(0), name=name)
+        if k == "dequantize":   # weights stored as int8, expanded on load (Core ML keeps them compressed)
+            return mb.constexpr_affine_dequantize(quantized_data=a["q"], scale=a["scale"].astype(np_dt),
+                                                  zero_point=np.int8(0), axis=a["axis"], name=name)
         if k in _REDUCE:
             return getattr(mb, _REDUCE[k])(x=x[0], axes=list(a["axes"]), keep_dims=a["keepdims"], name=name)
         if k == "softmax":
@@ -110,8 +175,15 @@ class CoreMLExecutable:
         if k in ("matmul", "conv2d"):
             epi = a.get("epilogue", ())
             core_name = name if not epi else f"{name}_core"
-            w_const = op.inputs[1].producer is not None and op.inputs[1].producer.is_const
-            if k == "matmul" and w_const and op.inputs[1].type.rank == 2 and op.inputs[0].type.rank <= 3:
+            wp = op.inputs[1].producer
+            w_const = wp is not None and wp.is_const
+            if k == "matmul" and wp is not None and wp.kind == "dequantize" and op.inputs[0].type.rank <= 3:
+                # int8 weight: keep it compressed in the model; `linear` wants it as [N, K]
+                qt = np.ascontiguousarray(wp.attrs["q"].T)
+                w = mb.constexpr_affine_dequantize(quantized_data=qt, scale=wp.attrs["scale"].astype(np_dt),
+                                                   zero_point=np.int8(0), axis=0)
+                acc = mb.linear(x=x[0], weight=w, name=core_name)
+            elif k == "matmul" and w_const and op.inputs[1].type.rank == 2 and op.inputs[0].type.rank <= 3:
                 # Emit `linear` (weight stored as [N, K]) rather than `matmul` with a constant y.
                 # Workaround: Core ML (coremltools 9.0, macOS 26) computes a constant-weight fp16
                 # matmul followed directly by a transpose incorrectly; `linear` is unaffected.
@@ -163,7 +235,12 @@ class CoreMLExecutable:
     def run(self, feeds: dict[ir.Value, np.ndarray]) -> dict[ir.Value, np.ndarray]:
         inputs = {self.in_names[v]: np.ascontiguousarray(arr.reshape(v.type.shape or (1,)), dtype=v.type.np_dtype)
                   for v, arr in feeds.items()}
-        res = self.model.predict(inputs)
+        if not self.warmed_up:      # the ANE program is built on first use; catch its failures too
+            with capture_native_output(self.native_log):
+                res = self.model.predict(inputs)
+            self.warmed_up = True
+        else:
+            res = self.model.predict(inputs)
         return {v: np.asarray(res[name]).reshape(v.type.shape).astype(v.type.np_dtype)
                 for v, name in self.out_names.items()}
 
@@ -171,7 +248,15 @@ class CoreMLExecutable:
         devs = [self.device_of(op.result) for op in self.g.compute_ops()]
         counts = {d: devs.count(d) for d in sorted(set(devs), key=str)}
         summary = ", ".join(f"{d or 'fused/renamed'}: {n}" for d, n in counts.items())
-        return f"coreml ({COMPUTE_UNITS[self.units]}): {len(devs)} ops -> {summary}"
+        text = f"coreml ({COMPUTE_UNITS[self.units]}): {len(devs)} ops -> {summary}"
+        if self.ane_rejected:
+            text += ("\nwarning: Apple's ANE compiler rejected part of this model; Core ML runs that part on "
+                     "the CPU/GPU instead (results are still correct)")
+        return text
+
+    @property
+    def ane_rejected(self) -> bool:
+        return any(ANE_FAILURE in line for line in self.native_log)
 
 
 class CoreMLTarget:
@@ -186,7 +271,7 @@ class CoreMLTarget:
         if any(v.type.rank > 5 for v in op.inputs) or op.result.type.rank > 5:
             return "Core ML supports tensors of rank <= 5"
         def is_const(v: ir.Value) -> bool:
-            return v.producer is not None and v.producer.is_const
+            return v.producer is not None and v.producer.is_constant_like
 
         if op.kind == "conv2d" and not is_const(op.inputs[1]):
             return "conv2d: Core ML needs constant weights"

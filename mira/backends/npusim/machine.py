@@ -4,8 +4,8 @@ It's modeled on real NPUs (TPU, AMD AIE, Apple ANE-style designs), simplified
 enough to read in one sitting:
 
     ┌──────────────────────────── MNPU-1 ───────────────────────────┐
-    │   DMA engine  <──────────────── DRAM (tensors, fp16) ────────┐  │
-    │      │                                                     │  │
+    │   DMA engine  <──────────────── DRAM (tensors) ───────────────┐  │
+    │      │   strided, transposing, and int8-dequantizing transfers │  │
     │      v                                                     │  │
     │   SRAM scratchpad  (512 KiB, fp16, 32 banks x 16 KiB)  ───────┘  │
     │      │        ^                                                │
@@ -24,13 +24,17 @@ That's what makes double buffering work: the DMA engine fills buffer 1 while
 the MXU is busy with buffer 0.
 
 The simulator is both functional (it produces real numbers, rounding to fp16
-whenever data lands in SRAM) and timed (it counts cycles per engine).
+whenever data lands in SRAM) and timed (it counts cycles per engine). In fast
+mode it skips the arithmetic and only counts cycles.
+
+Timing is a model, not a measurement: MNPU-1 doesn't exist in silicon. The
+constants in `Config` are plausible for a small edge NPU and can be changed.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Optional, Union
+from dataclasses import dataclass, field, fields
+from typing import Optional
 
 import numpy as np
 
@@ -46,7 +50,7 @@ class Config:
     mxu_dim: int = 32               # 32x32 systolic array = 1024 fp16 MACs/cycle
     vpu_lanes: int = 32
     dma_bytes_per_cycle: int = 64   # 64 GB/s at 1 GHz
-    dma_latency: int = 200          # cycles to start a transfer
+    dma_latency: int = 200          # cycles from issuing a transfer until its data lands (overlappable)
 
     @property
     def sram_elems(self) -> int:
@@ -63,6 +67,17 @@ class Config:
     @property
     def acc_bank_elems(self) -> int:
         return self.bank_bytes // 4
+
+    @classmethod
+    def from_overrides(cls, items: dict[str, str]) -> "Config":
+        """Config(**{'mxu_dim': '64', ...}) with values converted to the right types."""
+        types = {f.name: f.type for f in fields(cls)}
+        kw = {}
+        for k, v in items.items():
+            if k not in types:
+                raise ValueError(f"unknown MNPU-1 parameter '{k}' (known: {', '.join(types)})")
+            kw[k] = float(v) if types[k] in (float, "float") else int(v)
+        return cls(**kw)
 
 
 # ------------------------------------------------------------------ operands
@@ -85,20 +100,30 @@ class Tile:
 
 @dataclass(frozen=True)
 class DramRegion:
-    """A rectangle of a DRAM tensor, viewed as 2D [rows, cols]."""
+    """A (possibly strided) rectangle of a DRAM tensor, viewed as 2D [rows, cols].
+
+    Rows r0, r0 + row_stride, ... (nr of them) and columns c0, c0 + col_stride, ...
+    (nc of them). Strides let the DMA engine gather im2col patches, permute rows,
+    and read every other pixel without any compute.
+    """
     storage: str
     view_cols: int
     r0: int
     nr: int
     c0: int
     nc: int
+    row_stride: int = 1
+    col_stride: int = 1
 
     def __str__(self) -> str:
-        return f"{self.storage}[{self.r0}:{self.r0 + self.nr}, {self.c0}:{self.c0 + self.nc}]"
+        rs = f":{self.row_stride}" if self.row_stride != 1 else ""
+        cs = f":{self.col_stride}" if self.col_stride != 1 else ""
+        return (f"{self.storage}[{self.r0}:{self.r0 + self.nr * self.row_stride}{rs}, "
+                f"{self.c0}:{self.c0 + self.nc * self.col_stride}{cs}]")
 
 
-# broadcast modes for vector-unit sources
-FULL, ROW, SCALAR = "full", "row", "scalar"
+# broadcast modes for vector-unit sources (how a source tile maps onto the dst tile)
+FULL, ROW, COL, SCALAR = "full", "row", "col", "scalar"
 
 
 # ------------------------------------------------------------------ instructions
@@ -111,14 +136,20 @@ class Instr:
 
 @dataclass
 class Load(Instr):
+    """DRAM -> SRAM. Optionally transposes, and optionally dequantizes int8 data by a scale vector."""
     dst: Tile
     src: DramRegion
+    transpose: bool = False
+    scale: Optional[DramRegion] = None
+    scale_axis: int = 1          # scale per dst column (1) or per dst row (0)
 
     def __post_init__(self):
         self.engine = "dma"
 
     def __str__(self):
-        return f"dma.load    {self.dst} <- {self.src}"
+        extra = " (transpose)" if self.transpose else ""
+        extra += f" * {self.scale}" if self.scale else ""
+        return f"dma.load    {self.dst} <- {self.src}{extra}"
 
 
 @dataclass
@@ -149,7 +180,7 @@ class MatMul(Instr):
 
 @dataclass
 class Vec(Instr):
-    """dst = fn(*srcs), elementwise, with per-source broadcast (full / row / scalar)."""
+    """dst = fn(*srcs), elementwise, with per-source broadcast (full / row / col / scalar)."""
     fn: str
     dst: Tile
     srcs: list[tuple[Tile, str]]
@@ -164,8 +195,8 @@ class Vec(Instr):
 
 @dataclass
 class RowOp(Instr):
-    """Row-wise fused vector kernels: softmax over each row; layernorm with gamma/beta rows."""
-    fn: str                 # "softmax" | "layernorm"
+    """Row-wise vector kernels: softmax / layernorm (dst like src), rsum / rmean / rmax (dst is rows x 1)."""
+    fn: str
     dst: Tile
     src: Tile
     extra: list[Tile]
@@ -207,12 +238,24 @@ class Stats:
         return "\n".join(lines)
 
 
+def _broadcast(v: np.ndarray, mode: str, shape: tuple[int, int]) -> np.ndarray:
+    if mode == FULL:
+        return v
+    if mode == ROW:
+        return np.broadcast_to(v[:1], shape)
+    if mode == COL:
+        return np.broadcast_to(v[:, :1], shape)
+    return np.broadcast_to(v[:1, :1], shape)
+
+
 class Machine:
-    def __init__(self, cfg: Config = Config()):
+    def __init__(self, cfg: Config = Config(), functional: bool = True):
         self.cfg = cfg
-        self.sram = np.zeros(cfg.sram_elems, dtype=np.float16)
-        self.acc = np.zeros(cfg.acc_elems, dtype=np.float32)
-        self.dram: dict[str, np.ndarray] = {}   # flat fp16 storage per tensor
+        self.functional = functional
+        self.sram = np.zeros(cfg.sram_elems if functional else 0, dtype=np.float16)
+        self.acc = np.zeros(cfg.acc_elems if functional else 0, dtype=np.float32)
+        self.dram: dict[str, np.ndarray] = {}   # flat storage per tensor (fp16, or int8 for quantized weights)
+        self.itemsize: dict[str, int] = {}
 
     # ----- memory access helpers
 
@@ -231,35 +274,64 @@ class Machine:
 
     def dram_view(self, r: DramRegion) -> np.ndarray:
         flat = self.dram[r.storage]
-        return flat.reshape(-1, r.view_cols)[r.r0:r.r0 + r.nr, r.c0:r.c0 + r.nc]
+        return flat.reshape(-1, r.view_cols)[r.r0:r.r0 + r.nr * r.row_stride:r.row_stride,
+                                              r.c0:r.c0 + r.nc * r.col_stride:r.col_stride]
 
     def banks(self, t: Tile) -> set[str]:
         bank = self.cfg.sram_bank_elems if t.space == "sram" else self.cfg.acc_bank_elems
         return {f"{t.space}{b}" for b in range(t.addr // bank, (t.addr + t.size - 1) // bank + 1)}
 
+    def dma_cycles(self, r: DramRegion, itemsize: int, element_wise: bool) -> tuple[int, int]:
+        """(cycles, bytes) for moving region r. Contiguous rows stream at full bandwidth;
+        strided columns or transposes move one element per cycle."""
+        nbytes = r.nr * r.nc * itemsize
+        if element_wise or r.col_stride != 1:
+            cycles = r.nr * r.nc
+        elif r.nc == r.view_cols and r.row_stride == 1:
+            cycles = math.ceil(nbytes / self.cfg.dma_bytes_per_cycle)
+        else:   # one burst per row
+            cycles = r.nr * math.ceil(r.nc * itemsize / self.cfg.dma_bytes_per_cycle)
+        return cycles, nbytes
+
     # ----- semantics + cost of one instruction
 
     def execute(self, ins: Instr) -> tuple[int, set[str], set[str]]:
-        """Run `ins` functionally; return (cycles, resources read, resources written)."""
-        cfg = self.cfg
+        """Run `ins` (functionally unless in fast mode); return (busy cycles, resources read, resources written).
+
+        For DMA, busy cycles are the transfer time only; the startup latency is added by
+        `run`, because the engine keeps several transfers in flight and overlaps their latency.
+        """
+        cfg, fn = self.cfg, self.functional
         if isinstance(ins, Load):
-            data = self.dram_view(ins.src)
-            self.write(ins.dst, data.reshape(ins.dst.rows, ins.dst.cols))
-            nbytes = data.size * 2
+            size = self.itemsize.get(ins.src.storage, 2)
+            cycles, nbytes = self.dma_cycles(ins.src, size, ins.transpose)
+            reads = {f"dram:{ins.src.storage}"}
+            if fn:
+                data = self.dram_view(ins.src).astype(np.float32)
+                if ins.transpose:
+                    data = data.T
+                if ins.scale is not None:
+                    s = self.dram_view(ins.scale).astype(np.float32).reshape(-1)
+                    data = data * (s[None, :] if ins.scale_axis == 1 else s[:, None])
+                self.write(ins.dst, data.reshape(ins.dst.rows, ins.dst.cols))
+            if ins.scale is not None:
+                c2, b2 = self.dma_cycles(ins.scale, 2, False)
+                cycles, nbytes = cycles + c2, nbytes + b2
+                reads.add(f"dram:{ins.scale.storage}")
             self.stats.dram_bytes += nbytes
-            return (cfg.dma_latency + math.ceil(nbytes / cfg.dma_bytes_per_cycle),
-                    {f"dram:{ins.src.storage}"}, self.banks(ins.dst))
+            return cycles, reads, self.banks(ins.dst)
         if isinstance(ins, Store):
-            self.dram_view(ins.dst)[...] = self.read(ins.src).astype(np.float16)
-            nbytes = ins.src.size * 2
+            if fn:
+                self.dram_view(ins.dst)[...] = self.read(ins.src).astype(np.float16)
+            cycles, nbytes = self.dma_cycles(ins.dst, 2, False)
             self.stats.dram_bytes += nbytes
-            return (cfg.dma_latency + math.ceil(nbytes / cfg.dma_bytes_per_cycle),
-                    self.banks(ins.src), {f"dram:{ins.dst.storage}"})
+            return cycles, self.banks(ins.src), {f"dram:{ins.dst.storage}"}
         if isinstance(ins, MatMul):
             m, k = ins.a.rows, ins.a.cols
             n = ins.b.cols
-            prod = self.read(ins.a) @ self.read(ins.b)
-            self.write(ins.acc, self.read(ins.acc) + prod if ins.accumulate else prod)
+            if fn:
+                prod = self.read(ins.a) @ self.read(ins.b)
+                self.write(ins.acc, self.read(ins.acc) + prod if ins.accumulate else prod)
             self.stats.macs += m * k * n
             d = cfg.mxu_dim
             # weight-stationary systolic array: load a d x d block of B, stream m rows of A through it
@@ -268,35 +340,37 @@ class Machine:
             return cycles, reads, self.banks(ins.acc)
         if isinstance(ins, Vec):
             rows, cols = ins.dst.rows, ins.dst.cols
-            args = []
-            for t, mode in ins.srcs:
-                v = self.read(t)
-                args.append(v if mode == FULL else np.broadcast_to(v[:1] if mode == ROW else v[:1, :1], (rows, cols)))
-            if ins.fn == "copy":
-                out = args[0]
-            elif ins.fn in UNARY:
-                out = UNARY[ins.fn](args[0])
-            else:
-                out = BINARY[ins.fn](args[0], args[1])
-            self.write(ins.dst, out)
+            if fn:
+                args = [_broadcast(self.read(t), mode, (rows, cols)) for t, mode in ins.srcs]
+                if ins.fn == "copy":
+                    out = args[0]
+                elif ins.fn == "where":
+                    out = np.where(args[0] != 0, args[1], args[2])
+                elif ins.fn in UNARY:
+                    out = UNARY[ins.fn](args[0])
+                else:
+                    out = BINARY[ins.fn](args[0], args[1])
+                self.write(ins.dst, out)
             cost = 4 if ins.fn in SPECIAL else 1
             cycles = cost * math.ceil(rows * cols / cfg.vpu_lanes) + 8
             reads = set().union(*(self.banks(t) for t, _ in ins.srcs))
             return cycles, reads, self.banks(ins.dst)
         if isinstance(ins, RowOp):
-            x = self.read(ins.src)
-            if ins.fn == "softmax":
-                e = np.exp(x - x.max(axis=1, keepdims=True))
-                out = e / e.sum(axis=1, keepdims=True)
-                passes = 3 + 4   # max, sub/exp (special), sum, div
-            else:
-                g, b = (self.read(t)[:1] for t in ins.extra)
-                mu = x.mean(axis=1, keepdims=True)
-                var = ((x - mu) ** 2).mean(axis=1, keepdims=True)
-                out = (x - mu) / np.sqrt(var + ins.eps) * g + b
-                passes = 5 + 4
-            self.write(ins.dst, out)
-            cycles = passes * math.ceil(x.size / cfg.vpu_lanes) + 16
+            passes = {"softmax": 7, "layernorm": 9, "rsum": 1, "rmean": 2, "rmax": 1}[ins.fn]
+            if fn:
+                x = self.read(ins.src)
+                if ins.fn == "softmax":
+                    e = np.exp(x - x.max(axis=1, keepdims=True))
+                    out = e / e.sum(axis=1, keepdims=True)
+                elif ins.fn == "layernorm":
+                    g, b = (self.read(t)[:1] for t in ins.extra)
+                    mu = x.mean(axis=1, keepdims=True)
+                    var = ((x - mu) ** 2).mean(axis=1, keepdims=True)
+                    out = (x - mu) / np.sqrt(var + ins.eps) * g + b
+                else:
+                    out = {"rsum": np.sum, "rmean": np.mean, "rmax": np.max}[ins.fn](x, axis=1, keepdims=True)
+                self.write(ins.dst, out)
+            cycles = passes * math.ceil(ins.src.size / cfg.vpu_lanes) + 16
             reads = self.banks(ins.src).union(*(self.banks(t) for t in ins.extra))
             return cycles, reads, self.banks(ins.dst)
         raise TypeError(ins)
@@ -316,8 +390,9 @@ class Machine:
                 start = max(start, last_write.get(r, 0))
             for w in writes:                             # WAW + WAR
                 start = max(start, last_write.get(w, 0), last_read.get(w, 0))
-            end = start + cycles
-            engine_free[ins.engine] = end
+            latency = self.cfg.dma_latency if ins.engine == "dma" else 0
+            engine_free[ins.engine] = start + cycles     # the engine can issue its next request now
+            end = start + cycles + latency               # ...but this one's data lands later
             for r in reads:
                 last_read[r] = max(last_read.get(r, 0), end)
             for w in writes:
@@ -348,6 +423,3 @@ def format_timeline(trace: list, width: int = 72, limit: int = 40) -> str:
     if len(trace) > limit:
         lines.append(f"... {len(trace) - limit:,} more instructions")
     return "\n".join(lines)
-
-
-Operand = Union[Tile, DramRegion]

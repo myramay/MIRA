@@ -3,16 +3,14 @@ optimizer and the NPU simulator agree with the unoptimized CPU reference.
 
 When a seed fails, `print(generate(seed))` gives you the program to debug.
 """
-import importlib.util
-import platform
 import random
 
 import numpy as np
 import pytest
 
 import mira
+from conftest import HAS_COREML, HAS_IREE
 
-HAS_COREML = importlib.util.find_spec("coremltools") is not None and platform.system() == "Darwin"
 UNARY = ["relu", "gelu", "sigmoid", "tanh", "abs"]
 BINARY = ["+", "-", "*", "maximum", "minimum"]
 
@@ -34,7 +32,7 @@ def generate(seed: int) -> str:
     for i in range(r.randint(2, 8)):
         name, shape = live[-1]
         choice = r.choice(["matmul", "matmul", "bias", "unary", "binary", "scalar", "softmax", "layernorm",
-                           "reshape", "transpose"])
+                           "reshape", "transpose", "rowmax", "where", "rowsum"])
         new = f"t{i}"
         if choice == "matmul":
             n = r.randint(1, 90)
@@ -59,6 +57,12 @@ def generate(seed: int) -> str:
         elif choice == "reshape":
             shape = (shape[1], shape[0])
             expr = f"reshape({name}, [{shape[0]}, {shape[1]}])"
+        elif choice == "rowmax":
+            expr = f"{name} - max({name}, axis=1, keepdims=true)"
+        elif choice == "where":
+            expr = f"where({name} > 0, {name}, {name} * 0.1)"
+        elif choice == "rowsum":
+            expr = f"{name} + mean({name}, axis=1, keepdims=true)"
         else:
             shape = (shape[1], shape[0])
             expr = f"transpose({name})"
@@ -94,3 +98,9 @@ def test_npu_sim_matches_reference(seed):
 @pytest.mark.parametrize("seed", range(20))
 def test_coreml_matches_reference(seed):
     check(seed, "coreml", 3e-2)
+
+
+@pytest.mark.skipif(not HAS_IREE, reason="needs iree-base-compiler")
+@pytest.mark.parametrize("seed", range(20))
+def test_mlir_matches_reference(seed):
+    check(seed, "mlir", 3e-2)

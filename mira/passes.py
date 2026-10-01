@@ -27,7 +27,7 @@ def const_fold(g: ir.Graph) -> bool:
     """Evaluate ops whose inputs are all constants, at compile time."""
     changed = False
     for op in g.ops:
-        if op.is_const or not op.inputs or op.result.type.numel > FOLD_LIMIT:
+        if op.is_const or op.is_control or not op.inputs or op.result.type.numel > FOLD_LIMIT:
             continue
         vals = [_const_value(v) for v in op.inputs]
         if any(v is None for v in vals):
@@ -102,11 +102,15 @@ def simplify(g: ir.Graph) -> bool:
 
 # ------------------------------------------------------------------ CSE and DCE
 
+def _digest(a: np.ndarray) -> tuple:
+    return (a.dtype.str, a.shape, hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest())
+
+
 def _key(op: ir.Op):
     if op.is_const:
-        a = op.attrs["value"]
-        return ("const", a.dtype.str, a.shape, hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest())
-    return (op.kind, tuple(v.id for v in op.inputs), repr(sorted(op.attrs.items())))
+        return ("const",) + _digest(op.attrs["value"])
+    attrs = tuple(sorted((k, _digest(v) if isinstance(v, np.ndarray) else repr(v)) for k, v in op.attrs.items()))
+    return (op.kind, tuple(v.id for v in op.inputs), attrs)
 
 
 def cse(g: ir.Graph) -> bool:
@@ -114,9 +118,13 @@ def cse(g: ir.Graph) -> bool:
     seen: dict[tuple, ir.Op] = {}
     changed = False
     for op in g.ops:
+        if op.is_control:
+            continue
         k = _key(op)
         prev = seen.get(k)
-        if prev is not None and (not op.is_const or np.array_equal(prev.attrs["value"], op.attrs["value"])):
+        if prev is not None and (not op.is_constant_like or all(
+                np.array_equal(prev.attrs[k], op.attrs[k]) if isinstance(op.attrs[k], np.ndarray)
+                else prev.attrs[k] == op.attrs[k] for k in op.attrs)):
             g.replace_uses(op.result, prev.result)
             changed = True
         else:
@@ -129,7 +137,7 @@ def dce(g: ir.Graph) -> bool:
     live = set(g.outputs)
     kept = []
     for op in reversed(g.ops):
-        if op.result in live:
+        if any(r in live for r in op.results):
             kept.append(op)
             live.update(op.inputs)
     kept.reverse()
@@ -183,7 +191,7 @@ def fuse_epilogues(g: ir.Graph) -> bool:
             attrs["epilogue"] = tuple(op.attrs.get("epilogue", ())) + (step,)
             # The fused op takes u's place in the schedule: everything it reads
             # (op's inputs and u's other operand) is defined before u.
-            new = ir.Op(op.kind, inputs, attrs, u.result, op.loc)
+            new = ir.Op(op.kind, inputs, attrs, [u.result], op.loc)
             u.result.producer = new
             g.ops[position[u]] = new
             g.ops.remove(op)
@@ -195,29 +203,48 @@ def fuse_epilogues(g: ir.Graph) -> bool:
 
 # ------------------------------------------------------------------ precision lowering
 
-def to_f16(g: ir.Graph) -> bool:
-    """Run the whole graph in fp16 (what NPUs are built for), keeping the f32 interface.
+def to_f16(g: ir.Graph, keep_interface: bool = True) -> bool:
+    """Run the whole graph in fp16 (what NPUs are built for).
 
-    Casts are inserted at the graph inputs and outputs; internal casts become no-ops.
+    The top-level graph keeps its f32 interface (casts at inputs and outputs);
+    nested if/while graphs are converted completely, interface included, so loop
+    state stays fp16 on the accelerator instead of bouncing through f32 every
+    iteration. Internal casts become no-ops.
     """
-    if all(op.result.type.dtype == "f16" for op in g.ops) and all(v.type.dtype == "f16" for v in g.inputs):
+    if all(op.result.type.dtype == "f16" for op in g.ops if op.results) and \
+            all(v.type.dtype == "f16" for v in g.inputs):
         return False
     old_ops = g.ops
     g.ops = []
     remap: dict[ir.Value, ir.Value] = {}
     for v in g.inputs:
-        remap[v] = g.add("cast", [v], {"dtype": "f16"}) if v.type.dtype == "f32" else v
+        if v.type.dtype == "f32":
+            if keep_interface:
+                remap[v] = g.add("cast", [v], {"dtype": "f16"})
+            else:
+                v.type = v.type.with_dtype("f16")
+                remap[v] = v
+        else:
+            remap[v] = v
     for op in old_ops:
         if op.is_const:
             remap[op.result] = g.const(op.attrs["value"].astype(np.float16), op.loc)
         elif op.kind == "cast":
             remap[op.result] = remap[op.inputs[0]]
+        elif op.is_control:
+            for _, sub in op.subgraphs():
+                to_f16(sub, keep_interface=False)
+            types = [v.type for v in (op.attrs["then"].outputs if op.kind == "if" else op.attrs["body"].outputs)]
+            outs = g.add_control(op.kind, [remap[v] for v in op.inputs], op.attrs, types, op.loc)
+            remap.update(zip(op.results, outs))
         else:
             remap[op.result] = g.add(op.kind, [remap[v] for v in op.inputs], dict(op.attrs), op.loc)
     outs = []
     for v in g.outputs:
         nv = remap[v]
-        outs.append(g.add("cast", [nv], {"dtype": "f32"}) if v.type.dtype == "f32" and nv.type.dtype != "f32" else nv)
+        if keep_interface and v.type.dtype == "f32" and nv.type.dtype != "f32":
+            nv = g.add("cast", [nv], {"dtype": "f32"})
+        outs.append(nv)
     g.outputs = outs
     return True
 
@@ -242,7 +269,10 @@ def optimize(g: ir.Graph, fuse: bool = True, precision: Optional[str] = None,
         return changed
 
     if precision == "f16":
-        run("to-f16", to_f16)
+        run("to-f16", to_f16)        # converts nested graphs too
+    for op in g.ops:                 # then optimize nested graphs (if/while bodies)
+        for _, sub in op.subgraphs():
+            optimize(sub, fuse=fuse)
     for _ in range(10):   # iterate to a fixed point
         if not any([run(n, f) for n, f in PIPELINE]):
             break

@@ -1,12 +1,13 @@
 [project]
 name = "mira"
 version = "0.1.0"
-description = "A small tensor language that compiles to CPUs, a simulated NPU, and the Apple Neural Engine"
+description = "A small tensor language that compiles to CPUs, a simulated NPU, the Apple Neural Engine, and MLIR"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 coreml = ["coremltools>=8.0"]
+mlir = ["iree-base-compiler>=3.0", "iree-base-runtime>=3.0"]
 dev = ["pytest>=8"]
 
 [project.scripts]

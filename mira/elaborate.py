@@ -11,16 +11,23 @@ This single pass does semantic analysis *and* IR generation:
   * Inlining: user function calls disappear; the graph contains only ops.
   * Compile-time evaluation: numbers, shape symbols and loop variables are
     plain Python values, so `reshape(x, [B, H * W])` and `for i in 0..L`
-    are resolved here. `for` loops are fully unrolled.
+    are resolved here. `for` loops, and `if`/`while` on compile-time
+    conditions, are resolved completely.
+  * Data-dependent control flow: `if`/`while` on a *tensor* condition become
+    structured `if`/`while` ops that own sub-graphs. Variables assigned inside
+    become the op's results (loop-carried state for `while`); outer values
+    used inside are captured as explicit inputs.
+  * Automatic differentiation: `grad(y, x)` appends the backward pass (see autodiff.py).
 """
 from __future__ import annotations
 
 import difflib
+import itertools
 from typing import Optional, Union
 
 import numpy as np
 
-from . import ir
+from . import autodiff, ir
 from . import ops as O
 from . import syntax as S
 from .errors import Loc, MiraError
@@ -32,11 +39,12 @@ class DTypeValue(str):
 
 
 CTValue = Union[int, float, bool, list, DTypeValue]   # compile-time values
-Val = Union[ir.Value, CTValue]
+Val = Union[ir.Value, tuple, CTValue]                  # tuples come from multi-value returns
 
 REQUIRED = object()
 MAX_UNROLL = 10_000
 MAX_DEPTH = 64
+MAX_ITERS = 100_000
 
 BINOP_KIND = {"+": "add", "-": "sub", "*": "mul", "/": "div", "**": "pow"}
 
@@ -44,6 +52,8 @@ BINOP_KIND = {"+": "add", "-": "sub", "*": "mul", "/": "div", "**": "pow"}
 def describe(v: Val) -> str:
     if isinstance(v, ir.Value):
         return f"tensor {v.type}"
+    if isinstance(v, tuple):
+        return f"tuple of {len(v)} values"
     if isinstance(v, DTypeValue):
         return f"dtype {v}"
     if isinstance(v, bool):
@@ -55,18 +65,18 @@ def describe(v: Val) -> str:
     return type(v).__name__
 
 
+def is_num(v: Val) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 class Scope:
     def __init__(self, parent: Optional["Scope"] = None):
         self.vars: dict[str, Val] = {}
         self.parent = parent
 
     def lookup(self, name: str) -> Optional[Val]:
-        s: Optional[Scope] = self
-        while s is not None:
-            if name in s.vars:
-                return s.vars[name]
-            s = s.parent
-        return None
+        s = self.owner(name)
+        return s.vars[name] if s is not None else None
 
     def owner(self, name: str) -> Optional["Scope"]:
         s: Optional[Scope] = self
@@ -83,12 +93,94 @@ class Scope:
             s = s.parent
         return names
 
+    def snapshot(self) -> dict[tuple[int, str], tuple["Scope", Val]]:
+        out, s = {}, self
+        while s is not None:
+            for n, v in s.vars.items():
+                out[(id(s), n)] = (s, v)
+            s = s.parent
+        return out
+
+
+def restore(snap: dict) -> dict[tuple[int, str], Val]:
+    """Put snapshotted variables back; return the ones that had changed (key -> new value)."""
+    changed = {}
+    for key, (scope, old) in snap.items():
+        new = scope.vars[key[1]]
+        if new is not old:
+            changed[key] = new
+            scope.vars[key[1]] = old
+    return changed
+
+
+def assigned_names(body: list[S.Stmt]) -> list[str]:
+    out: list[str] = []
+    for st in body:
+        if isinstance(st, S.Assign):
+            out.extend(n for n in st.names if n not in out)
+        for sub in (getattr(st, "body", None), getattr(st, "then", None), getattr(st, "orelse", None)):
+            if sub:
+                out.extend(n for n in assigned_names(sub) if n not in out)
+    return out
+
+
+class GraphCtx:
+    """The graph currently being built, plus what it captured from enclosing graphs."""
+
+    def __init__(self, graph: ir.Graph, parent: Optional["GraphCtx"]):
+        self.graph = graph
+        self.parent = parent
+        self.captures: dict[ir.Value, ir.Value] = {}   # outer value -> placeholder input
+        self.captured_outer: list[ir.Value] = []       # in input order
+        self._owned: set[ir.Value] = set(graph.inputs)
+        self._synced = 0
+
+    def owns(self, v: ir.Value) -> bool:
+        for op in self.graph.ops[self._synced:]:
+            self._owned.update(op.results)
+        self._synced = len(self.graph.ops)
+        self._owned.update(self.graph.inputs)
+        return v in self._owned
+
 
 class Elaborator:
     def __init__(self, module: S.Module, graph_name: str):
         self.module = module
-        self.graph = ir.Graph(graph_name, [], [], [])
+        self.ctx = GraphCtx(ir.Graph(graph_name, [], [], []), None)
         self.stack: list[str] = []
+        self.counter = itertools.count()
+
+    @property
+    def graph(self) -> ir.Graph:
+        return self.ctx.graph
+
+    # ================================================================ graphs and captures
+
+    def local(self, v: ir.Value, ctx: Optional[GraphCtx] = None) -> ir.Value:
+        """Make `v` usable in `ctx`'s graph, capturing it from an enclosing graph if needed."""
+        ctx = ctx or self.ctx
+        if ctx.owns(v):
+            return v
+        if v in ctx.captures:
+            return ctx.captures[v]
+        if ctx.parent is None:
+            raise AssertionError(f"{v} is not defined in any enclosing graph")
+        if v.producer is not None and v.producer.is_const:   # constants are copied, not passed in
+            c = ctx.graph.const(v.producer.attrs["value"], v.producer.loc)
+        else:
+            c = ir.Value(v.type)
+            ctx.graph.inputs.append(c)
+            ctx.captured_outer.append(v)
+        ctx.captures[v] = c
+        return c
+
+    def enter(self, name: str) -> GraphCtx:
+        self.ctx = GraphCtx(ir.Graph(f"{self.graph.name}.{name}", [], [], []), self.ctx)
+        return self.ctx
+
+    def exit(self, ctx: GraphCtx) -> None:
+        assert self.ctx is ctx
+        self.ctx = ctx.parent
 
     # ================================================================ entry
 
@@ -112,7 +204,8 @@ class Elaborator:
                 if p.name in weights:
                     arr = np.asarray(weights[p.name])
                     if tuple(arr.shape) != ty.shape:
-                        raise MiraError(f"weight '{p.name}' has shape {list(arr.shape)} but the parameter is {ty}", p.loc)
+                        raise MiraError(f"weight '{p.name}' has shape {list(arr.shape)} but the parameter is {ty}",
+                                        p.loc)
                     arr = arr.astype(ty.np_dtype)
                 elif rng is not None:
                     arr = random_weight(rng, ty)
@@ -128,7 +221,7 @@ class Elaborator:
         if unknown:
             raise MiraError(f"weights given for unknown const parameters: {', '.join(sorted(unknown))}", fn.loc)
         out = self.call_function(fn, args, [p.loc for p in fn.params], fn.loc, preset=bindings)
-        self.graph.outputs = [self.as_tensor(out, fn.loc)]
+        self.graph.outputs = list(out) if isinstance(out, tuple) else [out]
         return self.graph
 
     # ================================================================ types
@@ -182,7 +275,7 @@ class Elaborator:
     # ================================================================ functions
 
     def call_function(self, fn: S.FnDecl, args: list[Val], arg_locs: list[Loc], call_loc: Loc,
-                      preset: Optional[dict[str, int]] = None) -> ir.Value:
+                      preset: Optional[dict[str, int]] = None) -> Union[ir.Value, tuple]:
         if fn.name in self.stack:
             raise MiraError(f"recursive call to '{fn.name}' (recursion can't be compiled to a static graph)", call_loc)
         if len(self.stack) >= MAX_DEPTH:
@@ -203,7 +296,7 @@ class Elaborator:
             if p.is_const and self.stack:
                 raise MiraError("'const' is only allowed on the entry function's parameters", p.loc)
             if not isinstance(a, ir.Value):
-                if isinstance(a, (int, float)) and not isinstance(a, bool):
+                if is_num(a):
                     a = self.graph.const(np.array(a, dtype=NP_DTYPES[p.type.dtype]), aloc)
                 else:
                     raise MiraError(f"argument '{p.name}' of '{fn.name}' must be a tensor, got {describe(a)}", aloc)
@@ -228,47 +321,34 @@ class Elaborator:
 
         self.stack.append(fn.name)
         try:
-            result = self.block(fn.body, scope, in_loop=False)
+            result = self.block(fn.body, scope, nested=False)
             if result is None:
                 raise MiraError(f"function '{fn.name}' doesn't return a value", fn.loc)
-            ret_ty = self.resolve_type(fn.ret, bindings)
             value, rloc = result
-            value = self.as_tensor(value, rloc, dtype=ret_ty.dtype)
-            if value.type != ret_ty:
-                raise MiraError(f"'{fn.name}' returns {value.type}, but its signature says {ret_ty}", rloc,
-                                notes=[f"declared return type: {fn.ret}"])
-            return value
+            ret_tys = [self.resolve_type(t, bindings) for t in fn.rets]
+            values = list(value) if isinstance(value, tuple) else [value]
+            if len(values) != len(ret_tys):
+                raise MiraError(f"'{fn.name}' returns {len(values)} value(s), but its signature declares "
+                                f"{len(ret_tys)}", rloc)
+            out = []
+            for v, want, decl in zip(values, ret_tys, fn.rets):
+                v = self.local(self.as_tensor(v, rloc, dtype=want.dtype))
+                if v.type != want:
+                    raise MiraError(f"'{fn.name}' returns {v.type}, but its signature says {want}", rloc,
+                                    notes=[f"declared return type: {decl}"])
+                out.append(v)
+            return tuple(out) if len(fn.rets) > 1 else out[0]
         finally:
             self.stack.pop()
 
     # ================================================================ statements
 
-    def block(self, body: list[S.Stmt], scope: Scope, in_loop: bool) -> Optional[tuple[Val, Loc]]:
+    def block(self, body: list[S.Stmt], scope: Scope, nested: bool) -> Optional[tuple[Val, Loc]]:
         for i, st in enumerate(body):
             if isinstance(st, S.Let):
-                if st.name in scope.vars:
-                    raise MiraError(f"'{st.name}' is already defined in this scope; use '{st.name} = ...' to reassign",
-                                    st.loc)
-                v = self.expr(st.value, scope)
-                if st.type is not None:
-                    want = self.resolve_type(st.type, self.shape_bindings(scope))
-                    v = self.as_tensor(v, st.value.loc, dtype=want.dtype)
-                    if v.type != want:
-                        raise MiraError(f"'{st.name}' is declared {want} but the value is {v.type}", st.value.loc)
-                scope.vars[st.name] = v
+                self.let(st, scope)
             elif isinstance(st, S.Assign):
-                owner = scope.owner(st.name)
-                if owner is None:
-                    raise MiraError(f"assignment to undefined variable '{st.name}'; declare it with 'let'", st.loc)
-                old = owner.vars[st.name]
-                v = self.expr(st.value, scope)
-                if isinstance(old, ir.Value):
-                    v = self.as_tensor(v, st.value.loc, dtype=old.type.dtype)
-                    if v.type != old.type:
-                        raise MiraError(f"'{st.name}' has type {old.type}; can't assign a {v.type}", st.value.loc)
-                elif isinstance(v, ir.Value):
-                    raise MiraError(f"'{st.name}' is a compile-time {describe(old)}; can't assign a tensor", st.loc)
-                owner.vars[st.name] = v
+                self.assign(st, scope)
             elif isinstance(st, S.For):
                 start = self.ct_int(self.expr(st.start, scope), st.start.loc, "loop bound")
                 stop = self.ct_int(self.expr(st.stop, scope), st.stop.loc, "loop bound")
@@ -277,15 +357,162 @@ class Elaborator:
                 for it in range(start, stop):
                     inner = Scope(scope)
                     inner.vars[st.var] = it
-                    self.block(st.body, inner, in_loop=True)
+                    self.block(st.body, inner, nested=True)
+            elif isinstance(st, S.If):
+                self.if_stmt(st, scope)
+            elif isinstance(st, S.While):
+                self.while_stmt(st, scope)
             elif isinstance(st, S.Return):
-                if in_loop:
-                    raise MiraError("'return' inside a loop isn't supported (loops are unrolled at compile time)",
-                                    st.loc)
+                if nested:
+                    raise MiraError("'return' must be the last statement of a function, not inside for/if/while; "
+                                    "assign to a variable instead", st.loc)
                 if i != len(body) - 1:
                     raise MiraError("unreachable code after 'return'", body[i + 1].loc)
                 return self.expr(st.value, scope), st.value.loc
         return None
+
+    def destructure(self, names: list[str], v: Val, loc: Loc) -> list[Val]:
+        if len(names) == 1:
+            if isinstance(v, tuple):
+                raise MiraError(f"this produces {len(v)} values; unpack them like 'let a, b = ...'", loc)
+            return [v]
+        if not isinstance(v, tuple) or len(v) != len(names):
+            raise MiraError(f"can't unpack {describe(v)} into {len(names)} names", loc)
+        return list(v)
+
+    def let(self, st: S.Let, scope: Scope) -> None:
+        for n in st.names:
+            if n in scope.vars:
+                raise MiraError(f"'{n}' is already defined in this scope; use '{n} = ...' to reassign", st.loc)
+        v = self.expr(st.value, scope)
+        if st.type is not None:
+            want = self.resolve_type(st.type, self.shape_bindings(scope))
+            v = self.as_tensor(v, st.value.loc, dtype=want.dtype)
+            if v.type != want:
+                raise MiraError(f"'{st.names[0]}' is declared {want} but the value is {v.type}", st.value.loc)
+        for n, x in zip(st.names, self.destructure(st.names, v, st.value.loc)):
+            scope.vars[n] = x
+
+    def assign(self, st: S.Assign, scope: Scope) -> None:
+        values = self.destructure(st.names, self.expr(st.value, scope), st.value.loc)
+        for n, v in zip(st.names, values):
+            owner = scope.owner(n)
+            if owner is None:
+                raise MiraError(f"assignment to undefined variable '{n}'; declare it with 'let'", st.loc)
+            old = owner.vars[n]
+            if isinstance(old, ir.Value):
+                v = self.as_tensor(v, st.value.loc, dtype=old.type.dtype)
+                if v.type != old.type:
+                    raise MiraError(f"'{n}' has type {old.type}; can't assign a {v.type}", st.value.loc)
+            elif isinstance(v, (ir.Value, tuple)):
+                raise MiraError(f"'{n}' is a compile-time {describe(old)}; can't assign a {describe(v)}", st.loc)
+            owner.vars[n] = v
+
+    def truthy(self, v: Val, loc: Loc) -> Optional[bool]:
+        """Compile-time truth value of a condition, or None if it's a runtime tensor."""
+        if isinstance(v, ir.Value):
+            if v.type.numel != 1:
+                raise MiraError(f"a condition must be a single value, got {v.type}; reduce it first "
+                                f"(e.g. with max or sum)", loc)
+            return None
+        if isinstance(v, bool) or is_num(v):
+            return bool(v)
+        raise MiraError(f"a condition must be a bool, a number, or a one-element tensor; got {describe(v)}", loc)
+
+    # ----- if
+
+    def if_stmt(self, st: S.If, scope: Scope) -> None:
+        cond = self.expr(st.cond, scope)
+        static = self.truthy(cond, st.cond.loc)
+        if static is not None:          # decided at compile time
+            self.block(st.then if static else st.orelse, Scope(scope), nested=True)
+            return
+
+        n = next(self.counter)
+        branches = []
+        for label, body in (("then", st.then), ("else", st.orelse)):
+            snap = scope.snapshot()
+            ctx = self.enter(f"if{n}.{label}")
+            self.block(body, Scope(scope), nested=True)
+            self.exit(ctx)
+            branches.append((ctx, restore(snap)))
+
+        keys = list(dict.fromkeys(k for _, changed in branches for k in changed))
+        snap = scope.snapshot()
+        result_types = []
+        for key in keys:
+            owner, orig = snap[key]
+            if not isinstance(orig, ir.Value):
+                raise MiraError(f"'{key[1]}' is a compile-time value; it can't change inside an 'if' whose "
+                                f"condition is only known at runtime", st.loc)
+            result_types.append(orig.type)
+        for ctx, changed in branches:
+            ctx.graph.outputs = [self.local(changed.get(k, snap[k][1]), ctx) for k in keys]
+
+        (then_ctx, _), (else_ctx, _) = branches
+        inputs = [self.local(cond)] + [self.local(v) for v in then_ctx.captured_outer] + \
+                 [self.local(v) for v in else_ctx.captured_outer]
+        results = self.graph.add_control(
+            "if", inputs, {"then": then_ctx.graph, "else": else_ctx.graph, "n_then": len(then_ctx.captured_outer)},
+            result_types, st.loc)
+        for key, r in zip(keys, results):
+            snap[key][0].vars[key[1]] = r
+
+    # ----- while
+
+    def while_stmt(self, st: S.While, scope: Scope) -> None:
+        cond = self.expr(st.cond, scope)
+        if self.truthy(cond, st.cond.loc) is not None:     # compile-time loop: run it now
+            for _ in range(MAX_UNROLL):
+                if not self.truthy(self.expr(st.cond, scope), st.cond.loc):
+                    return
+                self.block(st.body, Scope(scope), nested=True)
+            raise MiraError(f"compile-time while loop ran more than {MAX_UNROLL} iterations", st.loc)
+
+        names = []
+        for name in assigned_names(st.body):
+            v = scope.lookup(name)
+            if v is None:
+                continue
+            if not isinstance(v, ir.Value):
+                raise MiraError(f"'{name}' is a compile-time value; it can't change inside a 'while' whose "
+                                f"condition is only known at runtime", st.loc)
+            names.append(name)
+        init = [scope.lookup(nm) for nm in names]
+        n = next(self.counter)
+
+        def state_scope(ctx: GraphCtx) -> Scope:
+            s = Scope(scope)
+            for nm, v in zip(names, init):
+                ph = ir.Value(v.type)
+                ctx.graph.inputs.append(ph)
+                s.vars[nm] = ph
+            return s
+
+        cond_ctx = self.enter(f"while{n}.cond")
+        c = self.expr(st.cond, state_scope(cond_ctx))
+        if not isinstance(c, ir.Value) or c.type.numel != 1:
+            raise MiraError("the loop condition must stay a one-element tensor", st.cond.loc)
+        cond_ctx.graph.outputs = [self.local(c)]
+        self.exit(cond_ctx)
+
+        body_ctx = self.enter(f"while{n}.body")
+        s = state_scope(body_ctx)
+        snap = scope.snapshot()
+        self.block(st.body, Scope(s), nested=True)
+        if restore(snap):
+            raise MiraError("a compile-time value changed inside a runtime 'while' loop", st.loc)
+        body_ctx.graph.outputs = [self.local(s.vars[nm]) for nm in names]
+        self.exit(body_ctx)
+
+        inputs = [self.local(v) for v in init] + [self.local(v) for v in cond_ctx.captured_outer] + \
+                 [self.local(v) for v in body_ctx.captured_outer]
+        results = self.graph.add_control(
+            "while", inputs, {"cond": cond_ctx.graph, "body": body_ctx.graph, "n_state": len(names),
+                              "n_cond": len(cond_ctx.captured_outer), "max_iters": MAX_ITERS},
+            [v.type for v in init], st.loc)
+        for nm, r in zip(names, results):
+            scope.owner(nm).vars[nm] = r
 
     def shape_bindings(self, scope: Scope) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -306,6 +533,8 @@ class Elaborator:
             return DTypeValue(e.name)
         if isinstance(e, S.ListLit):
             return [self.expr(i, scope) for i in e.items]
+        if isinstance(e, S.TupleLit):
+            return tuple(self.expr(i, scope) for i in e.items)
         if isinstance(e, S.Name):
             v = scope.lookup(e.ident)
             if v is None:
@@ -319,7 +548,7 @@ class Elaborator:
             v = self.expr(e.operand, scope)
             if isinstance(v, ir.Value):
                 return self.op("neg", [v], {}, e.loc)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if is_num(v):
                 return -v
             raise MiraError(f"can't negate a {describe(v)}", e.loc)
         if isinstance(e, S.Binary):
@@ -329,9 +558,11 @@ class Elaborator:
         raise AssertionError(e)
 
     def binary(self, op: str, a: Val, b: Val, loc: Loc) -> Val:
-        a_num = isinstance(a, (int, float)) and not isinstance(a, bool)
-        b_num = isinstance(b, (int, float)) and not isinstance(b, bool)
-        if a_num and b_num:
+        if op in S.COMPARE_OPS and not isinstance(a, ir.Value) and not isinstance(b, ir.Value):
+            if not ((is_num(a) or isinstance(a, bool)) and (is_num(b) or isinstance(b, bool))):
+                raise MiraError(f"can't compare {describe(a)} and {describe(b)}", loc)
+            return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}[op]
+        if is_num(a) and is_num(b):
             if op == "@":
                 raise MiraError("'@' needs tensor operands", loc)
             if op == "/":
@@ -346,19 +577,30 @@ class Elaborator:
         b = self.as_tensor(b, loc, dtype)
         if op == "@":
             return self.op("matmul", [a, b], {}, loc)
+        if op in S.COMPARE_OPS:     # tensor comparisons give 1.0 / 0.0 masks
+            if op == "<":
+                return self.op("greater", [b, a], {}, loc)
+            if op == "<=":
+                return self.op("greater_equal", [b, a], {}, loc)
+            if op == ">":
+                return self.op("greater", [a, b], {}, loc)
+            if op == ">=":
+                return self.op("greater_equal", [a, b], {}, loc)
+            eq = self.op("equal", [a, b], {}, loc)
+            return eq if op == "==" else self.op("sub", [self.as_tensor(1, loc, dtype), eq], {}, loc)
         return self.op(BINOP_KIND[op], [a, b], {}, loc)
 
     def as_tensor(self, v: Val, loc: Loc, dtype: str = "f32") -> ir.Value:
         """Tensors pass through; numbers become scalar constants of `dtype`."""
         if isinstance(v, ir.Value):
             return v
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if is_num(v):
             return self.graph.const(np.array(v, dtype=NP_DTYPES[dtype]), loc)
         raise MiraError(f"expected a tensor, got {describe(v)}", loc)
 
     def op(self, kind: str, inputs: list[ir.Value], attrs: dict, loc: Loc) -> ir.Value:
         try:
-            return self.graph.add(kind, inputs, attrs, loc)
+            return self.graph.add(kind, [self.local(v) for v in inputs], attrs, loc)
         except O.OpTypeError as err:
             raise MiraError(str(err), loc) from None
 
@@ -386,6 +628,7 @@ class Elaborator:
             missing = [fn.params[i].name for i, a in enumerate(args) if a is None]
             if missing:
                 raise MiraError(f"call to '{fn.name}' is missing argument(s): {', '.join(missing)}", e.loc)
+            args = [self.local(a) if isinstance(a, ir.Value) else a for a in args]
             return self.call_function(fn, args, locs, e.loc)
         if e.callee in BUILTINS:
             params, handler = BUILTINS[e.callee]
@@ -423,7 +666,7 @@ class Elaborator:
         v, loc = arg
         if not isinstance(v, ir.Value):
             raise MiraError(f"expected a tensor, got {describe(v)}", loc)
-        return v
+        return self.local(v)
 
     def ct_int(self, v: Val, loc: Loc, what: str = "argument") -> int:
         if isinstance(v, bool) or not isinstance(v, int):
@@ -585,8 +828,52 @@ def _size(el: Elaborator, a, loc):
         raise MiraError(str(err), loc) from None
 
 
+def _grad(el: Elaborator, a, loc):
+    y = el.tensor(a["y"])
+    wrt, wloc = a["wrt"]
+    many = isinstance(wrt, (list, tuple))
+    xs = [el.tensor((w, wloc)) for w in (wrt if many else [wrt])]
+    try:
+        gs = autodiff.gradients(el.graph, y, xs, loc)
+    except autodiff.GradError as err:
+        raise MiraError(str(err), loc) from None
+    return tuple(gs) if many else gs[0]
+
+
+def _where(el: Elaborator, a, loc):
+    vals = [a[k][0] for k in ("cond", "a", "b")]
+    tensors = [v for v in vals if isinstance(v, ir.Value)]
+    if not tensors:
+        raise MiraError("where() needs at least one tensor argument; use if for compile-time choices", loc)
+    dt = tensors[0].type.dtype
+    return el.op("where", [el.as_tensor(v, a[k][1], dt) for v, k in zip(vals, ("cond", "a", "b"))], {}, loc)
+
+
+def _slice(el: Elaborator, a, loc):
+    return el.op("slice", [el.tensor(a["x"])], {"begin": tuple(el.ints(a["begin"])), "size": tuple(el.ints(a["size"]))},
+                 loc)
+
+
+def _pad(el: Elaborator, a, loc):
+    x = el.tensor(a["x"])
+    raw, ploc = a["pads"]
+    if not isinstance(raw, list) or not all(isinstance(p, list) and len(p) == 2 for p in raw):
+        raise MiraError("pad() takes pads like [[1, 1], [0, 2]]: one [before, after] pair per axis", ploc)
+    pads = tuple((el.ct_int(p[0], ploc), el.ct_int(p[1], ploc)) for p in raw)
+    return el.op("pad", [x], {"pads": pads}, loc)
+
+
+def _broadcast(el: Elaborator, a, loc):
+    return el.op("broadcast", [el.tensor(a["x"])], {"shape": tuple(el.ints(a["shape"]))}, loc)
+
+
 BUILTINS: dict[str, tuple[list[tuple[str, object]], object]] = {
-    **{k: _unary(k) for k in ["relu", "gelu", "sigmoid", "tanh", "exp", "log", "sqrt", "abs"]},
+    **{k: _unary(k) for k in ["relu", "gelu", "sigmoid", "tanh", "exp", "log", "sqrt", "abs", "sign"]},
+    "grad": ([("y", REQUIRED), ("wrt", REQUIRED)], _grad),
+    "where": ([("cond", REQUIRED), ("a", REQUIRED), ("b", REQUIRED)], _where),
+    "slice": ([("x", REQUIRED), ("begin", REQUIRED), ("size", REQUIRED)], _slice),
+    "pad": ([("x", REQUIRED), ("pads", REQUIRED)], _pad),
+    "broadcast": ([("x", REQUIRED), ("shape", REQUIRED)], _broadcast),
     "maximum": _binary_fn("maximum"),
     "minimum": _binary_fn("minimum"),
     "matmul": ([("a", REQUIRED), ("b", REQUIRED)],

@@ -98,6 +98,7 @@ UNARY: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "sqrt": np.sqrt,
     "abs": np.abs,
     "neg": np.negative,
+    "sign": np.sign,
 }
 
 BINARY: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
@@ -108,7 +109,12 @@ BINARY: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "pow": np.power,
     "maximum": np.maximum,
     "minimum": np.minimum,
+    # comparisons return 1.0 / 0.0 in the operands' dtype (masks you can multiply with)
+    "greater": np.greater,
+    "greater_equal": np.greater_equal,
+    "equal": np.equal,
 }
+COMPARISONS = {"greater", "greater_equal", "equal"}
 
 
 def _unary_infer(ts, a):
@@ -347,6 +353,124 @@ def _axis_infer_named(name):
 register("sort", "misc", _axis_infer_named("sort"), lambda xs, a: np.sort(xs[0], axis=a["axis"]))
 register("cumprod", "misc", _axis_infer_named("cumprod"),
          lambda xs, a: np.cumprod(f32(xs[0]), axis=a["axis"]).astype(xs[0].dtype))
+
+
+# ---------------------------------------------------------------- selection and data movement
+
+def _where_infer(ts, a):
+    dt = same_dtype(ts, "where")
+    shape = broadcast_shapes(broadcast_shapes(ts[0].shape, ts[1].shape, "where"), ts[2].shape, "where")
+    return TensorType(dt, shape)
+
+
+register("where", "misc", _where_infer,
+         lambda xs, a: np.where(xs[0] != 0, xs[1], xs[2]).astype(xs[1].dtype))
+
+
+def _broadcast_infer(ts, a):
+    shape = tuple(a["shape"])
+    if broadcast_shapes(ts[0].shape, shape, "broadcast") != shape:
+        raise OpTypeError(f"broadcast: {ts[0]} can't be broadcast to [{', '.join(map(str, shape))}]")
+    return TensorType(ts[0].dtype, shape)
+
+
+register("broadcast", "shape", _broadcast_infer, lambda xs, a: np.broadcast_to(xs[0], a["shape"]).copy())
+
+
+def _slice_infer(ts, a):
+    x = ts[0]
+    begin, size = tuple(a["begin"]), tuple(a["size"])
+    if len(begin) != x.rank or len(size) != x.rank:
+        raise OpTypeError(f"slice: begin and size need {x.rank} entries for {x}")
+    for b, s, d in zip(begin, size, x.shape):
+        if b < 0 or s < 0 or b + s > d:
+            raise OpTypeError(f"slice: [{b}, {b + s}) is out of bounds for a dimension of size {d}")
+    return TensorType(x.dtype, size)
+
+
+register("slice", "shape", _slice_infer,
+         lambda xs, a: xs[0][tuple(slice(b, b + s) for b, s in zip(a["begin"], a["size"]))].copy())
+
+
+def _pad_infer(ts, a):
+    x = ts[0]
+    pads = tuple(a["pads"])
+    if len(pads) != x.rank or any(lo < 0 or hi < 0 for lo, hi in pads):
+        raise OpTypeError(f"pad: need {x.rank} non-negative (before, after) pairs for {x}")
+    return TensorType(x.dtype, tuple(d + lo + hi for d, (lo, hi) in zip(x.shape, pads)))
+
+
+register("pad", "shape", _pad_infer, lambda xs, a: np.pad(xs[0], a["pads"]))
+
+
+# ---------------------------------------------------------------- quantized constants
+
+def _dequant_ref(xs, a):
+    q, scale, axis = a["q"], a["scale"], a["axis"]
+    shape = [1] * q.ndim
+    shape[axis] = -1
+    return (q.astype(np.float32) * scale.reshape(shape)).astype(NP_DTYPES[a["dtype"]])
+
+
+# A compressed constant: int8 values with one scale per channel along `axis` (no runtime inputs).
+register("dequantize", "const", lambda ts, a: TensorType(a["dtype"], tuple(a["q"].shape)), _dequant_ref)
+
+
+# ---------------------------------------------------------------- gradient-only ops (created by autodiff)
+
+def _conv2d_grad_input_infer(ts, a):
+    return TensorType(ts[0].dtype, tuple(a["in_shape"]))
+
+
+def _conv2d_grad_input_ref(xs, a):
+    """dL/dx for y = conv2d(x, w): scatter each output gradient back through the kernel."""
+    g, w = f32(xs[0]), f32(xs[1])
+    (sh, sw), (ph, pw) = a["stride"], a["padding"]
+    n, c, h, wd = a["in_shape"]
+    kh, kw = w.shape[2:]
+    oh, ow = g.shape[2:]
+    dx = np.zeros((n, c, h + 2 * ph, wd + 2 * pw), np.float32)
+    for i in range(kh):
+        for j in range(kw):
+            dx[:, :, i:i + sh * oh:sh, j:j + sw * ow:sw] += np.einsum("nohw,oc->nchw", g, w[:, :, i, j])
+    return dx[:, :, ph:ph + h, pw:pw + wd].astype(xs[0].dtype)
+
+
+def _conv2d_grad_weight_infer(ts, a):
+    return TensorType(ts[0].dtype, tuple(a["w_shape"]))
+
+
+def _conv2d_grad_weight_ref(xs, a):
+    """dL/dw for y = conv2d(x, w): correlate the input windows with the output gradient."""
+    x, g = f32(xs[0]), f32(xs[1])
+    (sh, sw), (ph, pw) = a["stride"], a["padding"]
+    kh, kw = a["w_shape"][2:]
+    x = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
+    win = np.lib.stride_tricks.sliding_window_view(x, (kh, kw), axis=(2, 3))[:, :, ::sh, ::sw]
+    win = win[:, :, :g.shape[2], :g.shape[3]]
+    return np.einsum("nohw,nchwij->ocij", g, win, optimize=True).astype(xs[0].dtype)
+
+
+def _maxpool2d_grad_ref(xs, a):
+    """dL/dx for y = maxpool2d(x): route each gradient to the (first) max in its window."""
+    x, g = f32(xs[0]), f32(xs[1])
+    k, s = a["size"], a["stride"]
+    oh, ow = g.shape[2:]
+    y = np.lib.stride_tricks.sliding_window_view(x, (k, k), axis=(2, 3))[:, :, ::s, ::s].max(axis=(-2, -1))
+    dx = np.zeros_like(x)
+    taken = np.zeros(y.shape, bool)
+    for i in range(k):
+        for j in range(k):
+            sl = (slice(None), slice(None), slice(i, i + s * oh, s), slice(j, j + s * ow, s))
+            hit = (x[sl] == y) & ~taken
+            dx[sl] += np.where(hit, g, 0)
+            taken |= hit
+    return dx.astype(xs[0].dtype)
+
+
+register("conv2d_grad_input", "grad", _conv2d_grad_input_infer, _conv2d_grad_input_ref)
+register("conv2d_grad_weight", "grad", _conv2d_grad_weight_infer, _conv2d_grad_weight_ref)
+register("maxpool2d_grad", "grad", lambda ts, a: ts[0], _maxpool2d_grad_ref)
 
 
 def infer(kind: str, types: list[TensorType], attrs: dict) -> TensorType:

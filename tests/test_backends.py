@@ -1,15 +1,13 @@
 """Differential tests: every target must agree with the CPU reference."""
 import glob
-import importlib.util
-import platform
 
 import numpy as np
 import pytest
 
 import mira
+from conftest import ACCEL, HAS_COREML, HAS_IREE, HAS_METAL
 
 EXAMPLES = sorted(glob.glob("examples/*.mira"))
-HAS_COREML = importlib.util.find_spec("coremltools") is not None and platform.system() == "Darwin"
 
 
 def feeds_for(p, seed=1):
@@ -22,7 +20,7 @@ def rel_err(a, b):
     return float(np.abs(a - b).max() / (np.abs(b).max() + 1e-12))
 
 
-TARGETS = ["npu-sim"] + (["coreml"] if HAS_COREML else [])
+TARGETS = ACCEL
 
 
 @pytest.mark.parametrize("target", TARGETS)
@@ -32,8 +30,12 @@ def test_example_matches_cpu(path, target):
     feeds = feeds_for(ref)
     expected = ref.run(feeds)
     got = mira.compile_file(path, target).run(feeds)
-    assert got.shape == expected.shape
-    assert rel_err(got, expected) < 2e-2   # fp16 tolerance
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    got = got if isinstance(got, tuple) else (got,)
+    assert len(got) == len(expected)
+    for g, e in zip(got, expected):
+        assert g.shape == e.shape
+        assert rel_err(g, e) < 2e-2   # fp16 tolerance
 
 
 def test_fallback_partitions_around_unsupported_ops():
@@ -88,3 +90,37 @@ def test_coreml_reports_neural_engine_placement():
     ex = p.segments[0].executable
     devices = {ex.device_of(op.result) for op in p.graph.compute_ops()}
     assert devices & {"ANE", "CPU", "GPU"}, devices
+
+
+@pytest.mark.skipif(not HAS_IREE, reason="needs iree-base-compiler")
+def test_mlir_module_is_valid_upstream_mlir():
+    import subprocess
+    import sys
+    from pathlib import Path
+    from mira.backends.mlir import emit_module, supported
+    iree_opt = Path(sys.executable).parent / "iree-opt"
+    for path in EXAMPLES:
+        g = mira.compile_file(path, "cpu").graph
+        if any(supported(op) for op in g.compute_ops()):
+            continue                   # e.g. sort: runs on the CPU, not in MLIR
+        text = emit_module(g)
+        r = subprocess.run([str(iree_opt), "-"], input=text, capture_output=True, text=True)
+        assert r.returncode == 0, f"{path}: {r.stderr[:2000]}"
+
+
+@pytest.mark.skipif(not HAS_IREE, reason="needs iree-base-compiler")
+def test_mlir_compiles_control_flow_onto_the_device():
+    src = ("fn main(x: f32[8]) -> f32[8] {\n  let y = x\n  while max(y) < 100 {\n    y = y * 2 + 1\n  }\n"
+           "  return y\n}\n")
+    p = mira.compile_source(src, "mlir", cost_model=False)
+    assert [s.device for s in p.segments] == ["mlir"]
+    x = np.linspace(1, 2, 8).astype(np.float32)
+    np.testing.assert_allclose(p.run({"x": x}), mira.compile_source(src).run({"x": x}), rtol=2e-3)  # fp16
+
+
+@pytest.mark.skipif(not HAS_METAL, reason="needs the Metal toolchain (xcodebuild -downloadComponent MetalToolchain)")
+def test_mlir_metal_gpu():
+    ref = mira.compile_file("examples/mlp.mira", "cpu")
+    x = np.random.default_rng(0).standard_normal((64, 784)).astype(np.float32)
+    got = mira.compile_file("examples/mlp.mira", "mlir", mlir_backend="metal").run({"x": x})
+    assert rel_err(got, ref.run({"x": x})) < 2e-2

@@ -1,0 +1,23 @@
+# One step of training an MLP classifier with SGD.
+# grad() differentiates the loss at compile time; the backward pass is ordinary
+# IR (matmuls, transposes, reductions), so it runs on the NPU like the forward.
+# The weights are runtime inputs (not const) because they change every step.
+
+fn forward(x: f32[B, D], w1: f32[D, H], b1: f32[H], w2: f32[H, C], b2: f32[C]) -> f32[B, C] {
+  return relu(x @ w1 + b1) @ w2 + b2
+}
+
+fn cross_entropy(logits: f32[B, C], labels: f32[B, C]) -> f32[] {
+  let z = logits - max(logits, axis=1, keepdims=true)
+  let log_probs = z - log(sum(exp(z), axis=1, keepdims=true))
+  return -sum(labels * log_probs) / B
+}
+
+fn main(x: f32[256, 64], labels: f32[256, 10],
+        w1: f32[64, 128], b1: f32[128], w2: f32[128, 10], b2: f32[10])
+    -> (f32[], f32[64, 128], f32[128], f32[128, 10], f32[10]) {
+  let loss = cross_entropy(forward(x, w1, b1, w2, b2), labels)
+  let g1, gb1, g2, gb2 = grad(loss, [w1, b1, w2, b2])
+  let lr = 0.5
+  return loss, w1 - lr * g1, b1 - lr * gb1, w2 - lr * g2, b2 - lr * gb2
+}
