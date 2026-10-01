@@ -174,3 +174,35 @@ def test_hardware_config_changes_timing():
         p.run({"x": x})
         cycles[dim] = next(s for s in p.segments if s.device == "npu-sim").executable.last_stats.cycles
     assert cycles["64"] < cycles["32"]
+
+
+def test_html_visualization(tmp_path):
+    """The interactive timeline page: data for every instruction, op and bank, embedded in one HTML file."""
+    import json
+    import re
+    from mira.backends.npusim.visualize import collect, render_html
+    src = open("examples/mlp.mira").read()
+    x = np.random.default_rng(0).standard_normal((64, 784)).astype(np.float32)
+    runs = []
+    for db in (True, False):
+        p = mira.compile_source(src, "npu-sim", double_buffer=db)
+        p.run({"x": x})
+        runs.append(collect("on" if db else "off", p))
+    on, off = runs
+    assert on["stats"]["cycles"] < off["stats"]["cycles"]
+    assert len(on["ins"]) == sum(on["stats"]["instrs"].values())
+    assert {o["name"].split()[0] for o in on["ops"]} >= {"matmul+add+relu", "softmax"}
+    assert on["banks"] and all(0 <= b[0] < len(on["bank_names"]) for b in on["banks"])
+    page = render_html(runs, "test", "sub")
+    data = json.loads(re.search(r"const DATA = (\{.*?\});\n", page, re.S).group(1).replace("<\\/", "</"))
+    assert [r["label"] for r in data["runs"]] == ["on", "off"]
+    assert "<script>" in page and "http" not in page.split("<script>")[1].split("const DATA")[0]   # self-contained
+
+
+def test_html_cli(tmp_path):
+    from mira.cli import main
+    out = tmp_path / "mlp.html"
+    assert main(["emit", "examples/mlp.mira", "-t", "sim", "-s", "html", "-o", str(out),
+                 "--compare", "mxu_dim=64"]) == 0
+    text = out.read_text()
+    assert "MNPU-1 simulation" in text and "mxu_dim=64" in text

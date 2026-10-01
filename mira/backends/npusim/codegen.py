@@ -235,6 +235,7 @@ class CodeGen:
         self.sizes: dict[str, tuple[int, type]] = {}
         self.consts: dict[str, np.ndarray] = {}
         self.quant: dict[ir.Value, tuple[str, int]] = {}    # dequantized value -> (scale storage, axis)
+        self.current_op = ""
         self.notes: list[str] = []
 
     # ----- DRAM
@@ -260,6 +261,7 @@ class CodeGen:
 
     def emit(self, ins: Instr, comment: str = "") -> None:
         ins.comment = comment
+        ins.op = self.current_op
         self.prog.append(ins)
 
     def fresh(self) -> tuple[Allocator, Allocator]:
@@ -307,6 +309,8 @@ class CodeGen:
                 self.place(op.result, alias_of=op.inputs[0])
                 continue
             self.place(op.result)
+            epi = "".join(f"+{fn}" for fn, _, _ in op.attrs.get("epilogue", ()))
+            self.current_op = f"{op.kind}{epi} {op.result!r}"
             if op.kind == "matmul":
                 self.matmul(op)
             elif op.kind == "conv2d":

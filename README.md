@@ -27,6 +27,20 @@ fn main(x: f32[256, 64], labels: f32[256, 10], w: f32[64, 10], b: f32[10])
 }
 ```
 
+## See inside the NPU
+
+`mira emit <program> -t sim -s html` runs a program on the simulated NPU and writes an interactive page:
+every instruction on every engine, the IR op it belongs to, and (optionally) every on-chip memory bank.
+Scroll to zoom, drag to pan, hover for details. `--compare` runs a variant side by side. Here, the same
+MLP with and without double buffering: with it, memory transfers (blue) overlap the matrix unit (orange):
+
+![MNPU-1 timeline: double buffering on vs off](docs/sim-timeline.png)
+
+```bash
+mira emit examples/mlp.mira -t sim -s html --compare no-double-buffer -o mlp.html && open mlp.html
+mira emit examples/attention.mira -t sim -s html --compare mxu_dim=64     # a bigger matrix unit
+```
+
 ## Setup
 
 ```bash

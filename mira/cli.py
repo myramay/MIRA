@@ -17,7 +17,7 @@ from .backends import TARGETS
 from .compiler import CompiledProgram, DynamicProgram, ShapeSpecialized, compile_file
 from .errors import MiraError
 
-STAGES = ["tokens", "ast", "ir", "opt", "passes", "partition", "asm", "timeline", "mlir"]
+STAGES = ["tokens", "ast", "ir", "opt", "passes", "partition", "asm", "timeline", "mlir", "html"]
 
 
 def _dims(items: list[str]) -> dict[str, int]:
@@ -134,6 +134,8 @@ def cmd_emit(args) -> int:
     elif args.stage == "passes":
         for name, text in prog.pass_log:
             print(f"// ----- after {name}\n{text}\n")
+    elif args.stage == "html":
+        return emit_html(args, prog)
     elif args.stage == "mlir":
         from .backends.mlir import emit_module, supported
         bad = [f"{op.kind}: {r}" for op in prog.graph.compute_ops() if (r := supported(op))]
@@ -156,6 +158,43 @@ def cmd_emit(args) -> int:
             print(s.executable.assembly(args.limit) if args.stage == "asm" else s.executable.timeline(args.limit))
             if args.stage == "timeline":
                 print(s.executable.report())
+    return 0
+
+
+def emit_html(args, prog: CompiledProgram) -> int:
+    """Run the program on the simulator and write the interactive timeline page."""
+    import copy
+    import os
+    from .backends.npusim.visualize import collect, render_html
+
+    if args.target != "npu-sim":
+        raise MiraError("the html view is for the simulated NPU: add -t sim")
+    feeds = _inputs(prog, args.inputs, args.seed)
+    prog.run(feeds)
+    runs = [prog]
+    labels = ["double buffering on" if not args.no_double_buffer else "double buffering off"]
+    if args.compare:
+        variant = copy.copy(args)
+        if args.compare == "no-double-buffer":
+            variant.no_double_buffer = not args.no_double_buffer
+            labels.append("double buffering off" if variant.no_double_buffer else "double buffering on")
+        elif "=" in args.compare:
+            variant.sim = list(args.sim or []) + [args.compare]
+            labels = ["baseline", args.compare]
+        else:
+            raise MiraError("--compare takes no-double-buffer or a hardware setting like mxu_dim=64")
+        other = _compile(variant, "npu-sim")
+        other.run(feeds)
+        runs.append(other)
+    data = [collect(label, p) for label, p in zip(labels, runs)]
+    cfg = data[0]["config"]
+    subtitle = (f"{os.path.basename(args.file)} on MNPU-1 · {cfg['mxu']} systolic array · {cfg['sram_kib']} KiB SRAM "
+                f"in {cfg['banks']} banks · {cfg['dma_gbs']:g} GB/s DMA · {cfg['clock_ghz']:g} GHz")
+    out = args.output or os.path.splitext(os.path.basename(args.file))[0] + ".sim.html"
+    with open(out, "w") as f:
+        f.write(render_html(data, "MNPU-1 simulation", subtitle))
+    n = sum(len(d["ins"]) for d in data)
+    print(f"wrote {out} ({os.path.getsize(out) / 1024:,.0f} KiB, {n:,} instructions). Open it with:  open {out}")
     return 0
 
 
@@ -235,6 +274,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("emit", help="print a compiler stage")
     common(p)
     p.add_argument("--stage", "-s", default="opt", choices=STAGES)
+    p.add_argument("--output", "-o", help="html stage: where to write the page (default: <name>.sim.html)")
+    p.add_argument("--compare", metavar="VARIANT",
+                   help="html stage: also run a variant, e.g. no-double-buffer or mxu_dim=64, and show both")
     p.add_argument("--limit", type=int, default=60)
     p.set_defaults(fn=cmd_emit)
 

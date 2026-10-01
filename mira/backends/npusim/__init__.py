@@ -16,6 +16,7 @@ class SimExecutable:
         self.g = g
         self.cfg = cfg
         self.fast = fast
+        self.double_buffer = double_buffer
         self.compiled = CodeGen(cfg, double_buffer).compile(g)
         self.machine = Machine(cfg, functional=not fast)
         # fast mode: timing only; the numbers come from the reference implementation

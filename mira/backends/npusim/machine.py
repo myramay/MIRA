@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 
@@ -132,6 +132,7 @@ FULL, ROW, COL, SCALAR = "full", "row", "col", "scalar"
 class Instr:
     engine: str = field(init=False, default="")
     comment: str = field(init=False, default="")
+    op: str = field(init=False, default="")      # the IR op this instruction implements (for tools)
 
 
 @dataclass
@@ -401,9 +402,23 @@ class Machine:
             self.stats.instrs[ins.engine] += 1
             end_all = max(end_all, end)
             if trace is not None:
-                trace.append((ins, start, end))
+                trace.append(TraceEntry(ins, start, start + cycles, end,
+                                        frozenset(r for r in reads if not r.startswith("dram:")),
+                                        frozenset(w for w in writes if not w.startswith("dram:"))))
         self.stats.cycles = end_all
         return self.stats
+
+
+class TraceEntry(NamedTuple):
+    """One executed instruction: when it started, when its engine was free again, when its result
+    was ready (later than busy_end for DMA, whose latency overlaps other work), and which on-chip
+    banks it read and wrote."""
+    ins: Instr
+    start: int
+    busy_end: int
+    end: int
+    reads: frozenset
+    writes: frozenset
 
 
 def format_timeline(trace: list, width: int = 72, limit: int = 40) -> str:
@@ -411,10 +426,10 @@ def format_timeline(trace: list, width: int = 72, limit: int = 40) -> str:
     if not trace:
         return ""
     rows = trace[:limit]
-    t_end = max(e for _, _, e in rows) or 1
+    t_end = max(t.end for t in rows) or 1
     scale = width / t_end
     lines = [f"{'engine':<6} {'start':>8} {'end':>8}  timeline (0 .. {t_end:,} cycles)"]
-    for ins, s, e in rows:
+    for ins, s, _, e, _, _ in rows:
         a = int(s * scale)
         b = max(a + 1, int(e * scale))
         mark = {"dma": "=", "mxu": "#", "vpu": "~"}[ins.engine]
