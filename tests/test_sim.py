@@ -206,3 +206,14 @@ def test_html_cli(tmp_path):
                  "--compare", "mxu_dim=64"]) == 0
     text = out.read_text()
     assert "MNPU-1 simulation" in text and "mxu_dim=64" in text
+
+
+def test_demo_site_builds(tmp_path):
+    """docs/build_site.py (deployed to GitHub Pages) must keep working as the code changes."""
+    import runpy
+    site = runpy.run_path("docs/build_site.py")
+    site["build"](str(tmp_path))
+    pages = {p.name for p in tmp_path.iterdir()}
+    assert "index.html" in pages and all(d[0] in pages for d in site["DEMOS"])
+    index = (tmp_path / "index.html").read_text()
+    assert all(f'href="{d[0]}"' in index for d in site["DEMOS"])

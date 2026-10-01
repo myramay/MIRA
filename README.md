@@ -1,8 +1,37 @@
 # MIRA
 
 [![tests](https://github.com/myramay/MIRA/actions/workflows/tests.yml/badge.svg)](https://github.com/myramay/MIRA/actions/workflows/tests.yml)
+[![live demo](https://img.shields.io/badge/live%20demo-NPU%20simulator-2f6fdf)](https://myramay.github.io/MIRA/)
 
-A small tensor language and compiler that runs neural-network programs, both inference and training, on four targets:
+**Mira is a programming language and compiler for running neural networks on neural processing units (NPUs)**,
+the AI accelerators inside phones and laptops. One program compiles to Apple's Neural Engine, to standard MLIR,
+and to a simulated NPU you can watch work instruction by instruction.
+
+**[▶ Try the live simulator demo](https://myramay.github.io/MIRA/)** · [How it works](docs/HOW_IT_WORKS.md)
+
+![MNPU-1 timeline: double buffering on vs off](docs/sim-timeline.png)
+
+## Highlights
+
+- **Runs on the Apple Neural Engine.** A 50M-parameter MLP runs in 8.6 ms on the ANE versus 82 ms in NumPy
+  (**9.6×**), and int8 weights make it **1.8× faster again**. Per-op placement is reported from Core ML itself.
+- **Trains on the NPU.** `grad()` differentiates programs at compile time; the backward pass is ordinary IR, so it
+  runs on every target. A training step is 3–4× faster with the Neural Engine enabled than on Core ML's CPU path.
+- **Runs existing models.** PyTorch MLPs, CNNs and transformers import via ONNX and match PyTorch's output
+  (to ~1e-7 on the CPU, within fp16 rounding on the accelerators).
+- **A tiny GPT, end to end.** [`examples/gpt.mira`](examples/gpt.mira) trains in about 2 seconds and generates
+  tokens with a KV cache inside a data-dependent `while` loop that compiles onto the device.
+- **A simulated NPU you can see inside.** MNPU-1 models banked SRAM, strided/transposing/int8 DMA, a 32×32
+  systolic array and a cycle-level scoreboard; `mira emit … -s html` draws every instruction on an interactive
+  timeline.
+- **Found real bugs in Apple's and Google's compilers.** Mira's fuzzer and tests caught Core ML computing an fp16
+  constant-weight matmul followed by a transpose wrong, Core ML crashing Python by freeing NumPy buffers on a
+  background thread, and IREE padding x86 max-reductions with 0 (so the max of negative numbers came out as 0),
+  plus several other IREE wrong-result and compile-failure bugs. Each has a workaround and a regression test.
+- **Tested hard.** About 380 tests, including random-program fuzzing across all backends, gradient checks
+  against finite differences and PyTorch parity, run in CI on every push.
+
+## Targets
 
 | target    | what it is                                                                              |
 |-----------|-----------------------------------------------------------------------------------------|
@@ -11,7 +40,7 @@ A small tensor language and compiler that runs neural-network programs, both inf
 | `coreml`  | Apple Neural Engine via Core ML (MIL), with per-op placement reporting                    |
 | `mlir`    | Standard MLIR (linalg/tensor/scf) compiled by IREE to native CPU code (or the Mac GPU via Metal) |
 
-Ops a target can't run fall back to the CPU automatically.
+Ops a target can't run fall back to the CPU automatically. A taste of the language, one SGD training step:
 
 ```mira
 fn dense(x: f32[B, N], w: f32[N, M], b: f32[M]) -> f32[B, M] {
@@ -33,8 +62,6 @@ fn main(x: f32[256, 64], labels: f32[256, 10], w: f32[64, 10], b: f32[10])
 every instruction on every engine, the IR op it belongs to, and (optionally) every on-chip memory bank.
 Scroll to zoom, drag to pan, hover for details. `--compare` runs a variant side by side. Here, the same
 MLP with and without double buffering: with it, memory transfers (blue) overlap the matrix unit (orange):
-
-![MNPU-1 timeline: double buffering on vs off](docs/sim-timeline.png)
 
 ```bash
 mira emit examples/mlp.mira -t sim -s html --compare no-double-buffer -o mlp.html && open mlp.html
@@ -67,7 +94,7 @@ python examples/train.py --target coreml               # train an MLP on the Neu
 python examples/gpt_train.py --target coreml           # train a tiny GPT, then generate with a KV cache
 mira run model.onnx -t coreml --check                  # run an ONNX model (e.g. exported from PyTorch)
 mira run model.onnx -t sim --shape x=4,3,224,224       # pin symbolic input dimensions
-python -m pytest                                       # ~370 tests: fuzzing, gradient checks, PyTorch parity
+python -m pytest                                       # ~380 tests: fuzzing, gradient checks, PyTorch parity
 ```
 
 From Python:
