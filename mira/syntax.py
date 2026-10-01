@@ -60,6 +60,21 @@ class ListLit(Expr):
 
 
 @dataclass
+class IndexItem:
+    """One subscript: `i` (start only), or a slice `a:b` / `:` / `a:` / `:b`."""
+    start: Optional["Expr"]
+    stop: Optional["Expr"]
+    is_slice: bool
+    loc: Loc
+
+
+@dataclass
+class Index(Expr):
+    base: Expr
+    items: list[IndexItem]
+
+
+@dataclass
 class TupleLit(Expr):
     items: list[Expr]
 
@@ -107,6 +122,14 @@ class Let(Stmt):
 @dataclass
 class Assign(Stmt):
     names: list[str]
+    value: Expr
+
+
+@dataclass
+class IndexAssign(Stmt):
+    """x[i, j] = value  (a functional update: x is rebound to a new tensor)."""
+    name: str
+    items: list[IndexItem]
     value: Expr
 
 
@@ -189,10 +212,24 @@ def format_expr(e: Expr, parent_prec: int = 0) -> str:
         lp, rp = (p + 1, p) if e.op == "**" else (p + 1, p + 1) if e.op in COMPARE_OPS else (p, p + 1)
         s = f"{format_expr(e.lhs, lp)} {e.op} {format_expr(e.rhs, rp)}"
         return f"({s})" if p < parent_prec else s
+    if isinstance(e, Index):
+        return f"{format_expr(e.base, 5)}[{format_items(e.items)}]"
     if isinstance(e, Call):
         args = ", ".join((f"{a.name}={format_expr(a.value)}" if a.name else format_expr(a.value)) for a in e.args)
         return f"{e.callee}({args})"
     raise TypeError(e)
+
+
+def format_items(items: list[IndexItem]) -> str:
+    out = []
+    for it in items:
+        a = format_expr(it.start) if it.start is not None else ""
+        if it.is_slice:
+            b = format_expr(it.stop) if it.stop is not None else ""
+            out.append(f"{a}:{b}")
+        else:
+            out.append(a)
+    return ", ".join(out)
 
 
 def format_module(m: Module) -> str:
@@ -205,6 +242,8 @@ def format_module(m: Module) -> str:
                 out.append(f"{indent}let {', '.join(s.names)}{ann} = {format_expr(s.value)}")
             elif isinstance(s, Assign):
                 out.append(f"{indent}{', '.join(s.names)} = {format_expr(s.value)}")
+            elif isinstance(s, IndexAssign):
+                out.append(f"{indent}{s.name}[{format_items(s.items)}] = {format_expr(s.value)}")
             elif isinstance(s, If):
                 out.append(f"{indent}if {format_expr(s.cond)} {{")
                 stmts(s.then, indent + "  ")

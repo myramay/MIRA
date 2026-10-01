@@ -9,6 +9,9 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 coreml = ["coremltools>=8.0"]
 mlir = ["iree-base-compiler>=3.0", "iree-base-runtime>=3.0"]
+onnx = ["onnx>=1.15"]
+# exporting PyTorch models for the ONNX tests
+torch = ["torch>=2.4", "onnxscript>=0.2"]
 dev = ["pytest>=8"]
 
 [project.scripts]

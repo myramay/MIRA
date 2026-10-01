@@ -199,7 +199,7 @@ def _gelu(b, op, g, need):
     return [b.mul(g, b.add(left, right))]
 
 
-@rule("sign", "greater", "greater_equal", "equal")
+@rule("sign", "greater", "greater_equal", "equal", "argmax", "argmin")
 def _zero(b, op, g, need):
     return [None] * len(op.inputs)   # piecewise constant: zero gradient
 
@@ -334,7 +334,46 @@ def _concat(b, op, g, need):
 
 @rule("cast")
 def _cast(b, op, g, need):
+    if not op.inputs[0].type.is_float or not op.result.type.is_float:
+        return [None]                     # integer conversions have no gradient
     return [b.op("cast", g, dtype=op.inputs[0].type.dtype)]
+
+
+@rule("erf")
+def _erf(b, op, g, need):
+    x = op.inputs[0]   # d/dx erf(x) = 2/sqrt(pi) * exp(-x^2)
+    return [b.mul(g, b.mul(b.scalar(1.1283791670955126, x), b.op("exp", b.neg(b.mul(x, x)))))]
+
+
+def _zeros_like(b: Builder, v: ir.Value) -> ir.Value:
+    return b.g.const(np.zeros(v.type.shape, dtype=v.type.np_dtype), b.loc)
+
+
+@rule("gather")
+def _gather(b, op, g, need):
+    table, idx = op.inputs   # rows that were read get their gradients added back (repeats accumulate)
+    return [b.op("scatter_add", _zeros_like(b, table), idx, g, axis=op.attrs["axis"]), None]
+
+
+@rule("scatter_add")
+def _scatter_add(b, op, g, need):
+    base, idx, upd = op.inputs
+    return [g if need[0] else None, None,
+            b.op("gather", g, idx, axis=op.attrs["axis"]) if need[2] else None]
+
+
+@rule("dynamic_slice")
+def _dynamic_slice(b, op, g, need):
+    x, start = op.inputs
+    return [b.op("dynamic_update_slice", _zeros_like(b, x), g, start), None]
+
+
+@rule("dynamic_update_slice")
+def _dynamic_update_slice(b, op, g, need):
+    x, upd, start = op.inputs
+    gx = b.op("dynamic_update_slice", g, _zeros_like(b, upd), start) if need[0] else None
+    gu = b.op("dynamic_slice", g, start, size=upd.type.shape) if need[1] else None
+    return [gx, gu, None]
 
 
 # ------------------------------------------------------------------ driver
@@ -342,6 +381,8 @@ def _cast(b, op, g, need):
 def gradients(g: ir.Graph, y: ir.Value, xs: list[ir.Value], loc=None) -> list[ir.Value]:
     if y.type.numel != 1:
         raise GradError(f"grad needs a scalar (one-element) output to differentiate, got {y.type}")
+    if not y.type.is_float or any(not x.type.is_float for x in xs):
+        raise GradError("grad needs floating-point tensors (integers have no derivative)")
     b = Builder(g, loc)
 
     # values that depend on any x (forward reachability)
@@ -357,7 +398,7 @@ def gradients(g: ir.Graph, y: ir.Value, xs: list[ir.Value], loc=None) -> list[ir
         gout = adj.get(op.result)
         if gout is None or op.is_const:
             continue
-        need = [v in depends for v in op.inputs]
+        need = [v in depends and v.type.is_float for v in op.inputs]
         if not any(need):
             continue
         fn = RULES.get(op.kind)

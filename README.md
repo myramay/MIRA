@@ -29,7 +29,8 @@ fn main(x: f32[256, 64], labels: f32[256, 10], w: f32[64, 10], b: f32[10])
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e '.[coreml,mlir,dev]'
+uv pip install --python .venv/bin/python -e '.[coreml,mlir,onnx,dev]'
+uv pip install --python .venv/bin/python -e '.[torch]'      # optional: to run the ONNX tests against PyTorch
 source .venv/bin/activate
 ```
 
@@ -47,7 +48,10 @@ mira emit examples/mlp.mira -t sim -s timeline         # engine timeline + utili
 mira bench examples/bench/big_mlp.mira --targets cpu,mlir,coreml:cpu,coreml:ne
 mira bench examples/bench/big_mlp.mira --targets npu-sim --sim-fast --sim mxu_dim=64
 python examples/train.py --target coreml               # train an MLP on the Neural Engine
-python -m pytest                                       # ~315 tests, including fuzzing and gradient checks
+python examples/gpt_train.py --target coreml           # train a tiny GPT, then generate with a KV cache
+mira run model.onnx -t coreml --check                  # run an ONNX model (e.g. exported from PyTorch)
+mira run model.onnx -t sim --shape x=4,3,224,224       # pin symbolic input dimensions
+python -m pytest                                       # ~370 tests: fuzzing, gradient checks, PyTorch parity
 ```
 
 From Python:
@@ -58,6 +62,9 @@ prog = mira.compile_file("examples/mlp.mira", "coreml", weights={...}, quantize=
 y = prog.run({"x": np.random.randn(64, 784).astype(np.float32)})
 print(prog.placement_report())
 
+# models exported from PyTorch / TensorFlow via ONNX
+resnet = mira.compile_onnx("model.onnx", "coreml")          # symbolic batch dims compile per shape
+
 # shapes known only at run time: compiled per shape, or per bucket with padding
 dyn = mira.compile_source("fn main(x: f32[B, 16], const w: f32[16, 8]) -> f32[B, 8] {\n  return x @ w\n}\n",
                           "coreml", buckets={"B": [8, 32, 128]})
@@ -66,15 +73,19 @@ dyn.run({"x": np.ones((5, 16), np.float32)})     # runs the B=8 specialization, 
 
 ## Language
 
-- Types: `f16[...]`, `f32[...]`. Dimensions are integers, shape symbols (`B`), or expressions (`H / 2`).
+- Types: `f16[...]`, `f32[...]`, `i32[...]`. Dimensions are integers, shape symbols (`B`), or expressions (`H / 2`).
+- Indexing like NumPy: `x[i]`, `x[:, 1:3]`, `x[-1]`, `emb[tokens]` (an `i32` tensor index is a gather), and
+  indexed assignment `buf[t] = v` (a functional update, also at a runtime position `t`).
 - Functions are generic over shape symbols and specialized per call. `int` parameters are compile-time integers.
   Functions can return several values: `-> (f32[], f32[4, 4])`, and `let a, b = f(x)` unpacks them.
 - Statements: `let`, reassignment, `for i in 0..N` (unrolled), `if`/`else if`/`else`, `while`, `return a, b`.
   `if` and `while` on compile-time values are resolved by the compiler. On one-element tensors they become
   real control flow. The CPU drives it on `npu-sim`/`coreml`; on `mlir` it compiles onto the device as `scf.if`/`scf.while`.
-- Operators: `+ - * / ** @` (NumPy broadcasting), comparisons `< <= > >= == !=` (give 1.0/0.0 masks on tensors).
-- Builtins: `relu gelu sigmoid tanh exp log sqrt abs sign maximum minimum matmul softmax sum mean max
-  transpose reshape flatten broadcast slice pad concat where conv2d maxpool2d layernorm cast size sort cumprod`
+- Operators: `+ - * / ** @` (NumPy broadcasting), comparisons `< <= > >= == !=` (give 1/0 masks on tensors).
+  A line ending in a comma or an operator continues on the next line.
+- Builtins: `relu gelu sigmoid tanh exp log sqrt abs sign erf maximum minimum matmul softmax sum mean max
+  argmax argmin transpose reshape flatten broadcast slice pad concat where gather scatter_add dynamic_slice
+  dynamic_update_slice conv2d maxpool2d layernorm cast size sort cumprod zeros ones full arange`
   and `grad(y, x)` / `grad(y, [x1, x2])` (reverse-mode autodiff, including higher-order).
 
 ## What each limitation became
@@ -88,6 +99,9 @@ dyn.run({"x": np.ones((5, 16), np.float32)})     # runs the B=8 specialization, 
 | simulator gaps | MNPU-1 now runs conv (implicit GEMM), pooling, any transpose, reductions, `where`, and int8 weights. It has a fast timing-only mode and configurable hardware (`--sim key=value`) |
 | not MLIR | the `mlir` target emits upstream MLIR and compiles it with IREE. `mira emit -s mlir` prints it |
 | Core ML placement is opaque | still decided by Core ML, but reported per op, and a warning is shown when Apple's ANE compiler rejects part of a model |
+| can't load existing models | `mira.compile_onnx` / `mira run model.onnx`: ONNX import with import-time folding of shape arithmetic; PyTorch MLPs, CNNs and transformers match PyTorch on every target |
+| no integers or indexing | `i32` tensors, NumPy-style indexing, `gather`/`scatter_add`/`argmax`, all differentiable where it makes sense |
+| no growing sequences | fixed-size buffers written at runtime positions (`dynamic_update_slice`, `buf[t] = v`). `examples/gpt.mira` trains a tiny GPT and generates with a KV cache in a `while` loop |
 
 Still true: the Neural Engine can only be reached through Core ML, which makes the final placement decisions, and MNPU-1's
 timing is a model of hardware that doesn't exist.
@@ -99,6 +113,7 @@ mira/
   lexer.py  parser.py  syntax.py     front end: text -> tokens -> AST
   elaborate.py                       type/shape checking, specialization, inlining, control flow -> IR
   autodiff.py                        reverse-mode differentiation (one VJP rule per op)
+  frontends/onnx_import.py           ONNX -> Mira IR (NumPy evaluation of everything known at import time)
   ir.py  types.py  ops.py            the IR (with structured if/while), every op's shape rule and reference semantics
   passes.py  quantize.py             const-fold, simplify, CSE, DCE, epilogue fusion, fp16 lowering, int8 weights
   partition.py                       device placement, scheduling, cost model, segments
@@ -107,6 +122,7 @@ mira/
   backends/coreml.py                 MIL emission, Neural Engine placement report
   backends/mlir.py                   MLIR emission (linalg/tensor/scf) + IREE compile & run
   backends/npusim/                   MNPU-1: codegen (tiling, memory planning, DMA) and machine
-examples/                            MLP, CNN, transformer block, residual loop, fallback, training
-tests/                               front end, passes, autodiff, control flow, backends, simulator, fuzzing
+examples/                            MLP, CNN, transformer block, residual loop, fallback, training, tiny GPT
+tests/                               front end, passes, autodiff, control flow, indexing, ONNX, GPT, backends,
+                                     simulator, fuzzing
 ```

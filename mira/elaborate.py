@@ -118,6 +118,8 @@ def assigned_names(body: list[S.Stmt]) -> list[str]:
     for st in body:
         if isinstance(st, S.Assign):
             out.extend(n for n in st.names if n not in out)
+        if isinstance(st, S.IndexAssign) and st.name not in out:
+            out.append(st.name)
         for sub in (getattr(st, "body", None), getattr(st, "then", None), getattr(st, "orelse", None)):
             if sub:
                 out.extend(n for n in assigned_names(sub) if n not in out)
@@ -349,6 +351,8 @@ class Elaborator:
                 self.let(st, scope)
             elif isinstance(st, S.Assign):
                 self.assign(st, scope)
+            elif isinstance(st, S.IndexAssign):
+                self.index_assign(st, scope)
             elif isinstance(st, S.For):
                 start = self.ct_int(self.expr(st.start, scope), st.start.loc, "loop bound")
                 stop = self.ct_int(self.expr(st.stop, scope), st.stop.loc, "loop bound")
@@ -555,6 +559,8 @@ class Elaborator:
             return self.binary(e.op, self.expr(e.lhs, scope), self.expr(e.rhs, scope), e.loc)
         if isinstance(e, S.Call):
             return self.call(e, scope)
+        if isinstance(e, S.Index):
+            return self.index(e, scope)
         raise AssertionError(e)
 
     def binary(self, op: str, a: Val, b: Val, loc: Loc) -> Val:
@@ -595,6 +601,8 @@ class Elaborator:
         if isinstance(v, ir.Value):
             return v
         if is_num(v):
+            if dtype == "i32" and float(v) != int(v):
+                raise MiraError(f"can't mix the number {v} with an i32 tensor; cast the tensor to f32 first", loc)
             return self.graph.const(np.array(v, dtype=NP_DTYPES[dtype]), loc)
         raise MiraError(f"expected a tensor, got {describe(v)}", loc)
 
@@ -603,6 +611,115 @@ class Elaborator:
             return self.graph.add(kind, [self.local(v) for v in inputs], attrs, loc)
         except O.OpTypeError as err:
             raise MiraError(str(err), loc) from None
+
+    # ================================================================ indexing
+
+    def subscripts(self, items: list[S.IndexItem], shape: tuple[int, ...], scope: Scope, loc: Loc):
+        """Classify each subscript as ("int", k) / ("slice", a, b) / ("tensor", value); pad with full slices."""
+        if len(items) > len(shape):
+            raise MiraError(f"too many indices ({len(items)}) for a rank-{len(shape)} tensor", loc)
+        out = []
+        for axis, (it, d) in enumerate(zip(items + [None] * (len(shape) - len(items)), shape)):
+            if it is None:
+                out.append(("slice", 0, d))
+                continue
+            if it.is_slice:
+                bounds = []
+                for b, default in ((it.start, 0), (it.stop, d)):
+                    v = default if b is None else self.expr(b, scope)
+                    if isinstance(v, ir.Value):
+                        raise MiraError("slice bounds must be compile-time numbers; for a runtime start use "
+                                        "dynamic_slice(x, start, size)", it.loc)
+                    v = self.ct_int(v, it.loc, "slice bound")
+                    bounds.append(max(0, min(d, v + d if v < 0 else v)))
+                a, b = bounds
+                if b <= a:
+                    raise MiraError(f"empty slice {a}:{b} on an axis of size {d}", it.loc)
+                out.append(("slice", a, b))
+                continue
+            v = self.expr(it.start, scope)
+            if isinstance(v, ir.Value):
+                if v.type.dtype != "i32":
+                    raise MiraError(f"tensor indices must be i32, got {v.type}; use cast(i, i32)", it.loc)
+                out.append(("tensor", self.local(v)))
+            else:
+                k = self.ct_int(v, it.loc, "index")
+                if not -d <= k < d:
+                    raise MiraError(f"index {k} is out of range for an axis of size {d}", it.loc)
+                out.append(("int", k % d))
+        return out
+
+    def index(self, e: S.Index, scope: Scope) -> ir.Value:
+        x = self.expr(e.base, scope)
+        if not isinstance(x, ir.Value):
+            raise MiraError(f"can't index a {describe(x)}", e.loc)
+        x = self.local(x)
+        subs = self.subscripts(e.items, x.type.shape, scope, e.loc)
+        # 1. every static subscript at once, as one slice op
+        begin = tuple(s[1] if s[0] != "tensor" else 0 for s in subs)
+        size = tuple(1 if s[0] == "int" else s[2] - s[1] if s[0] == "slice" else d
+                     for s, d in zip(subs, x.type.shape))
+        if size != x.type.shape:
+            x = self.op("slice", [x], {"begin": begin, "size": size}, e.loc)
+        # 2. drop the axes indexed by a single integer
+        kept = [i for i, s in enumerate(subs) if s[0] != "int"]
+        if len(kept) != len(subs):
+            x = self.op("reshape", [x], {"shape": tuple(size[i] for i in kept)}, e.loc)
+        # 3. runtime (tensor) indices become gathers
+        pos_shift = 0
+        for new_axis, i in enumerate(kept):
+            if subs[i][0] == "tensor":
+                idx = subs[i][1]
+                x = self.op("gather", [x, idx], {"axis": new_axis + pos_shift}, e.loc)
+                pos_shift += idx.type.rank - 1
+        return x
+
+    def start_vector(self, parts: list[Union[int, ir.Value]], loc: Loc) -> ir.Value:
+        """i32[n] start position from compile-time ints and one-element i32 tensors."""
+        if all(isinstance(p, int) for p in parts):
+            return self.graph.const(np.array(parts, dtype=np.int32), loc)
+        pieces = []
+        for p in parts:
+            if isinstance(p, int):
+                pieces.append(self.graph.const(np.array([p], dtype=np.int32), loc))
+            else:
+                if p.type.dtype != "i32" or p.type.numel != 1:
+                    raise MiraError(f"a runtime position must be a one-element i32 tensor, got {p.type}", loc)
+                pieces.append(self.op("reshape", [p], {"shape": (1,)}, loc))
+        return self.op("concat", pieces, {"axis": 0}, loc)
+
+    def index_assign(self, st: S.IndexAssign, scope: Scope) -> None:
+        owner = scope.owner(st.name)
+        if owner is None:
+            raise MiraError(f"assignment to undefined variable '{st.name}'; declare it with 'let'", st.loc)
+        x = owner.vars[st.name]
+        if not isinstance(x, ir.Value):
+            raise MiraError(f"'{st.name}' is a compile-time {describe(x)}; only tensors can be indexed", st.loc)
+        x = self.local(x)
+        subs = self.subscripts(st.items, x.type.shape, scope, st.loc)
+        starts, region, value_shape = [], [], []
+        for s, d in zip(subs, x.type.shape):
+            if s[0] == "int":
+                starts.append(s[1])
+                region.append(1)
+            elif s[0] == "slice":
+                starts.append(s[1])
+                region.append(s[2] - s[1])
+                value_shape.append(s[2] - s[1])
+            else:
+                if s[1].type.numel != 1:
+                    raise MiraError("indexed assignment takes one position per axis; use scatter_add for many",
+                                    st.loc)
+                starts.append(s[1])
+                region.append(1)
+        v = self.as_tensor(self.expr(st.value, scope), st.value.loc, dtype=x.type.dtype)
+        if v.type.dtype != x.type.dtype:
+            raise MiraError(f"can't store a {v.type} into '{st.name}' ({x.type})", st.value.loc)
+        if v.type.shape != tuple(value_shape):
+            v = self.op("broadcast", [v], {"shape": tuple(value_shape)}, st.value.loc)
+        v = self.op("reshape", [v], {"shape": tuple(region)}, st.value.loc)
+        start = self.start_vector(starts, st.loc)
+        owner.vars[st.name] = self.op("dynamic_update_slice", [x, v, start], {}, st.loc)
 
     # ================================================================ calls
 
@@ -841,12 +958,12 @@ def _grad(el: Elaborator, a, loc):
 
 
 def _where(el: Elaborator, a, loc):
-    vals = [a[k][0] for k in ("cond", "a", "b")]
-    tensors = [v for v in vals if isinstance(v, ir.Value)]
-    if not tensors:
-        raise MiraError("where() needs at least one tensor argument; use if for compile-time choices", loc)
-    dt = tensors[0].type.dtype
-    return el.op("where", [el.as_tensor(v, a[k][1], dt) for v, k in zip(vals, ("cond", "a", "b"))], {}, loc)
+    c, x, y = (a[k][0] for k in ("cond", "a", "b"))
+    if not isinstance(c, ir.Value):
+        raise MiraError("where() needs a tensor condition; use if for compile-time choices", a["cond"][1])
+    vals = [v for v in (x, y) if isinstance(v, ir.Value)]
+    dt = vals[0].type.dtype if vals else "f32"
+    return el.op("where", [c, el.as_tensor(x, a["a"][1], dt), el.as_tensor(y, a["b"][1], dt)], {}, loc)
 
 
 def _slice(el: Elaborator, a, loc):
@@ -863,12 +980,80 @@ def _pad(el: Elaborator, a, loc):
     return el.op("pad", [x], {"pads": pads}, loc)
 
 
+def _dtype_arg(el: Elaborator, arg) -> str:
+    dt, dloc = arg
+    if not isinstance(dt, DTypeValue):
+        raise MiraError(f"expected a dtype like f32 or i32, got {describe(dt)}", dloc)
+    return str(dt)
+
+
+def _filled(value):
+    def h(el: Elaborator, a, loc):
+        shape = el.ints(a["shape"]) if isinstance(a["shape"][0], list) else [el.int_(a["shape"])]
+        v = value if value is not None else el.float_(a["value"])
+        dt = _dtype_arg(el, a["dtype"])
+        return el.graph.const(np.full(shape, v, dtype=NP_DTYPES[dt]), loc)
+    return h
+
+
+def _arange(el: Elaborator, a, loc):
+    start = el.int_(a["start"])
+    stop = None if a["stop"][0] is None else el.int_(a["stop"])
+    lo, hi = (0, start) if stop is None else (start, stop)
+    return el.graph.const(np.arange(lo, hi, dtype=NP_DTYPES[_dtype_arg(el, a["dtype"])]), loc)
+
+
+def _gather(el: Elaborator, a, loc):
+    return el.op("gather", [el.tensor(a["x"]), el.tensor(a["indices"])], {"axis": el.int_(a["axis"])}, loc)
+
+
+def _scatter_add(el: Elaborator, a, loc):
+    return el.op("scatter_add", [el.tensor(a["base"]), el.tensor(a["indices"]), el.tensor(a["updates"])],
+                 {"axis": el.int_(a["axis"])}, loc)
+
+
+def _arg(kind):
+    return ([("x", REQUIRED), ("axis", -1), ("keepdims", False)],
+            lambda el, a, loc: el.op(kind, [el.tensor(a["x"])], {"axis": el.int_(a["axis"]),
+                                                                 "keepdims": el.bool_(a["keepdims"])}, loc))
+
+
+def _start(el: Elaborator, arg) -> ir.Value:
+    v, loc = arg
+    if isinstance(v, ir.Value):
+        return el.local(v)
+    if not isinstance(v, list):
+        raise MiraError("a start position is a list like [t, 0] or an i32 tensor", loc)
+    return el.start_vector([el.local(p) if isinstance(p, ir.Value) else el.ct_int(p, loc) for p in v], loc)
+
+
+def _dynamic_slice(el: Elaborator, a, loc):
+    return el.op("dynamic_slice", [el.tensor(a["x"]), _start(el, a["start"])], {"size": tuple(el.ints(a["size"]))},
+                 loc)
+
+
+def _dynamic_update_slice(el: Elaborator, a, loc):
+    x = el.tensor(a["x"])
+    upd = el.as_tensor(a["update"][0], a["update"][1], dtype=x.type.dtype)
+    return el.op("dynamic_update_slice", [x, upd, _start(el, a["start"])], {}, loc)
+
+
 def _broadcast(el: Elaborator, a, loc):
     return el.op("broadcast", [el.tensor(a["x"])], {"shape": tuple(el.ints(a["shape"]))}, loc)
 
 
 BUILTINS: dict[str, tuple[list[tuple[str, object]], object]] = {
-    **{k: _unary(k) for k in ["relu", "gelu", "sigmoid", "tanh", "exp", "log", "sqrt", "abs", "sign"]},
+    **{k: _unary(k) for k in ["relu", "gelu", "sigmoid", "tanh", "exp", "log", "sqrt", "abs", "sign", "erf"]},
+    "zeros": ([("shape", REQUIRED), ("dtype", DTypeValue("f32"))], _filled(0)),
+    "ones": ([("shape", REQUIRED), ("dtype", DTypeValue("f32"))], _filled(1)),
+    "full": ([("shape", REQUIRED), ("value", REQUIRED), ("dtype", DTypeValue("f32"))], _filled(None)),
+    "arange": ([("start", REQUIRED), ("stop", None), ("dtype", DTypeValue("i32"))], _arange),
+    "gather": ([("x", REQUIRED), ("indices", REQUIRED), ("axis", 0)], _gather),
+    "scatter_add": ([("base", REQUIRED), ("indices", REQUIRED), ("updates", REQUIRED), ("axis", 0)], _scatter_add),
+    "argmax": _arg("argmax"),
+    "argmin": _arg("argmin"),
+    "dynamic_slice": ([("x", REQUIRED), ("start", REQUIRED), ("size", REQUIRED)], _dynamic_slice),
+    "dynamic_update_slice": ([("x", REQUIRED), ("update", REQUIRED), ("start", REQUIRED)], _dynamic_update_slice),
     "grad": ([("y", REQUIRED), ("wrt", REQUIRED)], _grad),
     "where": ([("cond", REQUIRED), ("a", REQUIRED), ("b", REQUIRED)], _where),
     "slice": ([("x", REQUIRED), ("begin", REQUIRED), ("size", REQUIRED)], _slice),
@@ -899,6 +1084,8 @@ BUILTINS: dict[str, tuple[list[tuple[str, object]], object]] = {
 
 def random_weight(rng: np.random.Generator, ty: TensorType) -> np.ndarray:
     """Deterministic, sensibly-scaled random weights (so activations stay O(1))."""
+    if not ty.is_float:
+        return rng.integers(0, 8, ty.shape).astype(ty.np_dtype)
     if ty.rank == 0:
         return np.array(rng.standard_normal(), dtype=ty.np_dtype)
     if ty.rank == 1:

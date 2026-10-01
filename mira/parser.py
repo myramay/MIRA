@@ -10,6 +10,7 @@ Grammar (EBNF):
     block    := "{" { NEWLINE | stmt } "}"
     stmt     := "let" names [ ":" type ] "=" expr
               | names "=" expr
+              | IDENT "[" item { "," item } "]" "=" expr
               | "for" IDENT "in" expr ".." expr block
               | "if" expr block [ "else" ( block | if-stmt ) ]
               | "while" expr block
@@ -19,7 +20,8 @@ Grammar (EBNF):
     sum      := term { ("+" | "-") term }
     term     := unary { ("*" | "/" | "@") unary }
     unary    := "-" unary | power
-    power    := primary [ "**" unary ]            (right-associative, like Python)
+    power    := postfix [ "**" unary ]            (right-associative, like Python)
+    postfix  := primary { "[" item { "," item } "]" }      item := expr | [expr] ":" [expr]
     primary  := INT | FLOAT | "true" | "false" | DTYPE | IDENT [ "(" args ")" ]
               | "(" expr ")" | "(" expr "," [ expr { "," expr } ] ")" | "[" [ expr { "," expr } ] "]"
     args     := [ arg { "," arg } ]
@@ -179,6 +181,12 @@ class Parser:
         if self.accept("kw", "while"):
             cond = self.expr()
             return S.While(t.loc, cond, self.block())
+        if self.at("ident") and self.peek().kind == "op" and self.peek().text == "[":
+            name = self.expect("ident").text
+            self.expect("op", "[")
+            items = self.index_items()
+            self.expect("op", "=", "'=' (only assignments like x[i] = v can start with an indexed name)")
+            return S.IndexAssign(t.loc, name, items, self.expr())
         if self.at("ident") and self.peek().kind == "op" and self.peek().text in ("=", ","):
             names = self.name_list("variable name")
             self.expect("op", "=")
@@ -243,10 +251,34 @@ class Parser:
         return self.power()
 
     def power(self) -> S.Expr:
-        base = self.primary()
+        base = self.postfix()
         if (t := self.accept("op", "**")) is not None:
             return S.Binary(t.loc, "**", base, self.unary())
         return base
+
+    def postfix(self) -> S.Expr:
+        """primary { "[" index_items "]" }   e.g. x[0], x[:, 1:3], emb[tokens]"""
+        e = self.primary()
+        while self.at("op", "["):
+            loc = self.tok.loc
+            self.pos += 1
+            e = S.Index(loc, e, self.index_items())
+        return e
+
+    def index_items(self) -> list[S.IndexItem]:
+        items = []
+        while True:
+            loc = self.tok.loc
+            start = None if self.at("op", ":") else self.expr()
+            if self.accept("op", ":"):
+                stop = None if (self.at("op", ",") or self.at("op", "]")) else self.expr()
+                items.append(S.IndexItem(start, stop, True, loc))
+            else:
+                items.append(S.IndexItem(start, None, False, loc))
+            if not self.accept("op", ","):
+                break
+        self.expect("op", "]")
+        return items
 
     def primary(self) -> S.Expr:
         t = self.tok

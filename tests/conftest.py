@@ -18,3 +18,8 @@ HAS_METAL = HAS_IREE and _has_metal_toolchain()
 
 # accelerator targets to test against the CPU reference
 ACCEL = ["npu-sim"] + (["coreml"] if HAS_COREML else []) + (["mlir"] if HAS_IREE else [])
+
+# example programs with a `main` entry point (gpt.mira has its own entries and its own tests)
+import glob as _glob
+
+MAIN_EXAMPLES = sorted(p for p in _glob.glob("examples/*.mira") if "fn main(" in open(p).read())

@@ -211,8 +211,8 @@ def to_f16(g: ir.Graph, keep_interface: bool = True) -> bool:
     state stays fp16 on the accelerator instead of bouncing through f32 every
     iteration. Internal casts become no-ops.
     """
-    if all(op.result.type.dtype == "f16" for op in g.ops if op.results) and \
-            all(v.type.dtype == "f16" for v in g.inputs):
+    if all(op.result.type.dtype != "f32" for op in g.ops if op.results) and \
+            all(v.type.dtype != "f32" for v in g.inputs):
         return False
     old_ops = g.ops
     g.ops = []
@@ -228,9 +228,13 @@ def to_f16(g: ir.Graph, keep_interface: bool = True) -> bool:
             remap[v] = v
     for op in old_ops:
         if op.is_const:
-            remap[op.result] = g.const(op.attrs["value"].astype(np.float16), op.loc)
+            value = op.attrs["value"]
+            remap[op.result] = g.const(value.astype(np.float16) if value.dtype.kind == "f" else value, op.loc)
         elif op.kind == "cast":
-            remap[op.result] = remap[op.inputs[0]]
+            # float<->float casts disappear; casts to or from integers stay (aimed at f16)
+            src = remap[op.inputs[0]]
+            target = "f16" if op.attrs["dtype"] in ("f16", "f32") else op.attrs["dtype"]
+            remap[op.result] = src if src.type.dtype == target else g.add("cast", [src], {"dtype": target}, op.loc)
         elif op.is_control:
             for _, sub in op.subgraphs():
                 to_f16(sub, keep_interface=False)

@@ -1,7 +1,7 @@
 """Lexer: source text -> list of tokens.
 
 Newlines are significant (they end statements), except inside (...) and [...],
-so long argument lists can be wrapped across lines.
+and after a trailing comma or operator, so long lines can be wrapped.
 """
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from .errors import Loc, MiraError
 
 KEYWORDS = {"fn", "let", "return", "for", "in", "const", "true", "false", "if", "else", "while"}
-DTYPES = {"f16", "f32"}
+DTYPES = {"f16", "f32", "i32"}
+
+# A line ending in one of these continues on the next line (e.g. a long return list).
+CONTINUES = {",", "=", "+", "-", "*", "/", "@", "**", "->", "<", "<=", ">", ">=", "==", "!=", ".."}
 
 # Longest operators first so "->" wins over "-" and ".." over ".".
 OPERATORS = ["->", "..", "**", "<=", ">=", "==", "!=", "<", ">",
@@ -45,7 +48,8 @@ def tokenize(source: str, filename: str = "<input>") -> list[Token]:
             continue
 
         if c == "\n":
-            if depth == 0 and tokens and tokens[-1].kind != "newline":
+            continues = tokens and tokens[-1].kind == "op" and tokens[-1].text in CONTINUES
+            if depth == 0 and tokens and tokens[-1].kind != "newline" and not continues:
                 tokens.append(Token("newline", "\\n", loc()))
             i += 1
             line += 1

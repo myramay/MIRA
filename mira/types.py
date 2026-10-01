@@ -5,8 +5,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-NP_DTYPES = {"f16": np.float16, "f32": np.float32}
-BYTES = {"f16": 2, "f32": 4}
+NP_DTYPES = {"f16": np.float16, "f32": np.float32, "i32": np.int32}
+BYTES = {"f16": 2, "f32": 4, "i32": 4}
+FLOAT_DTYPES = {"f16", "f32"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,10 @@ class TensorType:
     @property
     def np_dtype(self):
         return NP_DTYPES[self.dtype]
+
+    @property
+    def is_float(self) -> bool:
+        return self.dtype in FLOAT_DTYPES
 
     def with_dtype(self, dtype: str) -> "TensorType":
         return TensorType(dtype, self.shape)

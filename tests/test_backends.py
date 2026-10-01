@@ -1,13 +1,12 @@
 """Differential tests: every target must agree with the CPU reference."""
-import glob
 
 import numpy as np
 import pytest
 
 import mira
-from conftest import ACCEL, HAS_COREML, HAS_IREE, HAS_METAL
+from conftest import ACCEL, HAS_COREML, HAS_IREE, HAS_METAL, MAIN_EXAMPLES
 
-EXAMPLES = sorted(glob.glob("examples/*.mira"))
+EXAMPLES = MAIN_EXAMPLES
 
 
 def feeds_for(p, seed=1):
@@ -124,3 +123,21 @@ def test_mlir_metal_gpu():
     x = np.random.default_rng(0).standard_normal((64, 784)).astype(np.float32)
     got = mira.compile_file("examples/mlp.mira", "mlir", mlir_backend="metal").run({"x": x})
     assert rel_err(got, ref.run({"x": x})) < 2e-2
+
+
+@pytest.mark.skipif(not HAS_COREML, reason="needs macOS + coremltools")
+def test_coreml_survives_idle_cleanup():
+    """Regression: Core ML frees the last prediction's NumPy inputs on a background thread when the
+    model goes idle, which used to crash the interpreter a few seconds after a small prediction."""
+    import subprocess
+    import sys
+    code = "\n".join([
+        "import time, numpy as np, mira",
+        "src = 'fn main(x: f32[8, 32], const w: f32[32, 32]) -> f32[8, 32] {\\n  return relu(x @ w)\\n}\\n'",
+        "p = mira.compile_source(src, 'coreml')",
+        "p.run({'x': np.ones((8, 32), np.float32)})",
+        "time.sleep(3)",
+        "print('survived')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "survived" in r.stdout, r.stderr[-2000:]

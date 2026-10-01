@@ -31,7 +31,12 @@ from ..types import TensorType
 GELU_C = 0.7978845608028654
 GELU_K = 0.044715
 
-UNSUPPORTED = {"sort", "cumprod", "conv2d_grad_input", "conv2d_grad_weight", "maxpool2d_grad"}
+UNSUPPORTED = {"sort", "cumprod", "conv2d_grad_input", "conv2d_grad_weight", "maxpool2d_grad", "scatter_add"}
+I32_MAX, I32_MIN = 2**31 - 1, -2**31
+
+
+def is_int(dt: str) -> bool:
+    return dt.startswith("i")
 
 
 def ttype(t: TensorType) -> str:
@@ -39,6 +44,8 @@ def ttype(t: TensorType) -> str:
 
 
 def scalar_lit(x: float, dtype: str) -> str:
+    if is_int(dtype):
+        return str(I32_MAX if x == np.inf else I32_MIN if x == -np.inf else int(x))
     x = float(x)
     if np.isinf(x):
         # IEEE bit patterns for +/- infinity
@@ -52,7 +59,7 @@ def dense(arr: np.ndarray) -> str:
     flat = np.ascontiguousarray(arr)
     if flat.size == 1:
         v = flat.ravel()[0]
-        if flat.dtype == np.int8:
+        if flat.dtype.kind == "i":
             return f"dense<{int(v)}>"
         return f"dense<{scalar_lit(float(v), 'f16' if flat.dtype == np.float16 else 'f32')}>"
     return f'dense<"0x{flat.astype(flat.dtype.newbyteorder("<")).tobytes().hex().upper()}">'
@@ -161,11 +168,12 @@ class Emitter:
         return v
 
     def reduce(self, v: str, t: TensorType, axes: tuple[int, ...], kind: str) -> tuple[str, TensorType]:
-        """linalg.reduce over `axes` (keepdims=False) with add or max."""
+        """linalg.reduce over `axes` (keepdims=False) with add, max or min."""
         out_t = TensorType(t.dtype, tuple(d for i, d in enumerate(t.shape) if i not in axes))
-        init = self.fill(out_t, 0.0 if kind == "add" else -np.inf)
+        init = self.fill(out_t, {"add": 0.0, "max": -np.inf, "min": np.inf}[kind])
         r = self.fresh()
-        op = "arith.addf" if kind == "add" else "arith.maximumf"
+        op = ({"add": "arith.addi", "max": "arith.maxsi", "min": "arith.minsi"} if is_int(t.dtype) else
+              {"add": "arith.addf", "max": "arith.maximumf", "min": "arith.minimumf"})[kind]
         self.emit(f"{r} = linalg.reduce ins({v} : {ttype(t)}) outs({init} : {ttype(out_t)}) "
                   f"dimensions = [{', '.join(map(str, axes))}]")
         self.emit(f"  (%in: {t.dtype}, %acc: {t.dtype}) {{")
@@ -211,11 +219,24 @@ class Emitter:
                 n = self.fresh().replace("%t", "%s")
                 L.append(f"{n} = {text}")
                 return n
+            if is_int(dt) and kind in ("relu", "neg", "abs", "sign"):
+                zero = c(0)
+                if kind == "relu":
+                    r = op(f"arith.maxsi {x}, {zero} : {dt}")
+                elif kind == "neg":
+                    r = op(f"arith.subi {zero}, {x} : {dt}")
+                elif kind == "abs":
+                    r = op(f"math.absi {x} : {dt}")
+                else:
+                    pos = op(f"arith.extui {op(f'arith.cmpi sgt, {x}, {zero} : {dt}')} : i1 to {dt}")
+                    neg = op(f"arith.extui {op(f'arith.cmpi slt, {x}, {zero} : {dt}')} : i1 to {dt}")
+                    r = op(f"arith.subi {pos}, {neg} : {dt}")
+                return L, r
             if kind == "relu":
                 r = op(f"arith.maximumf {x}, {c(0.0)} : {dt}")
             elif kind == "neg":
                 r = op(f"arith.negf {x} : {dt}")
-            elif kind in ("exp", "log", "sqrt", "tanh"):
+            elif kind in ("exp", "log", "sqrt", "tanh", "erf"):
                 r = op(f"math.{kind} {x} : {dt}")
             elif kind == "abs":
                 r = op(f"math.absf {x} : {dt}")
@@ -244,12 +265,19 @@ class Emitter:
                   "pow": "math.powf", "maximum": "arith.maximumf", "minimum": "arith.minimumf"}
         preds = {"greater": "ogt", "greater_equal": "oge", "equal": "oeq"}
 
+        if is_int(dt):
+            simple = {"add": "arith.addi", "sub": "arith.subi", "mul": "arith.muli",
+                      "maximum": "arith.maxsi", "minimum": "arith.minsi"}
+            preds = {"greater": "sgt", "greater_equal": "sge", "equal": "eq"}
+
         def body(a):
             x, y = a
             n = self.fresh().replace("%t", "%s")
             if kind in simple:
                 return [f"{n} = {simple[kind]} {x}, {y} : {dt}"], n
             b = self.fresh().replace("%t", "%s")
+            if is_int(dt):
+                return [f"{b} = arith.cmpi {preds[kind]}, {x}, {y} : {dt}", f"{n} = arith.extui {b} : i1 to {dt}"], n
             return [f"{b} = arith.cmpf {preds[kind]}, {x}, {y} : {dt}", f"{n} = arith.uitofp {b} : i1 to {dt}"], n
         return body
 
@@ -318,9 +346,10 @@ class Emitter:
         """i1 truth value of a one-element tensor. The comparison runs on the device and the
         host only reads back an i32 (IREE's host VM has no fp16 scalars)."""
         flag_t = TensorType("i32", t.shape)
+        cmp = "arith.cmpi ne" if is_int(t.dtype) else "arith.cmpf une"
         flags = self.generic(flag_t, [(v, t)], lambda args: ([
-            f"%z = arith.constant {scalar_lit(0.0, t.dtype)} : {t.dtype}",
-            f"%b = arith.cmpf une, {args[0]}, %z : {t.dtype}", "%i = arith.extui %b : i1 to i32"], "%i"))
+            f"%z = arith.constant {scalar_lit(0, t.dtype)} : {t.dtype}",
+            f"%b = {cmp}, {args[0]}, %z : {t.dtype}", "%i = arith.extui %b : i1 to i32"], "%i"))
         idx = []
         for _ in range(t.rank):
             z = self.fresh()
@@ -370,20 +399,44 @@ class Emitter:
             self.emit(f"  linalg.yield %m : {dt}")
             self.emit(f"}} -> {ttype(out)}")
             return r
-        if k in ("relu", "neg", "exp", "log", "sqrt", "tanh", "abs", "sigmoid", "gelu", "sign"):
+        if k in ("relu", "neg", "exp", "log", "sqrt", "tanh", "abs", "sigmoid", "gelu", "sign", "erf"):
             return self.generic(out, ins, self.unary_body(k, dt))
         if k in ("add", "sub", "mul", "div", "pow", "maximum", "minimum", "greater", "greater_equal", "equal"):
             return self.generic(out, ins, self.binary_body(k, dt))
         if k == "where":
+            cdt = op.inputs[0].type.dtype
+            cmp = "arith.cmpi ne" if is_int(cdt) else "arith.cmpf une"
+
             def body(args):
                 c, x, y = args
-                return ([f"%z = arith.constant {scalar_lit(0.0, dt)} : {dt}", f"%b = arith.cmpf une, {c}, %z : {dt}",
+                return ([f"%z = arith.constant {scalar_lit(0, cdt)} : {cdt}", f"%b = {cmp}, {c}, %z : {cdt}",
                          f"%r = arith.select %b, {x}, {y} : {dt}"], "%r")
             return self.generic(out, ins, body)
         if k == "cast":
             src = op.inputs[0].type.dtype
-            conv = "arith.extf" if (src, dt) == ("f16", "f32") else "arith.truncf"
+            if is_int(src) and is_int(dt):
+                return ins[0][0]
+            conv = ("arith.sitofp" if is_int(src) else "arith.fptosi" if is_int(dt) else
+                    "arith.extf" if (src, dt) == ("f16", "f32") else "arith.truncf")
             return self.generic(out, ins, lambda args: ([f"%r = {conv} {args[0]} : {src} to {dt}"], "%r"))
+        if k == "gather":
+            return self.gather(ins[0], ins[1], out, a["axis"] % ins[0][1].rank)
+        if k in ("argmax", "argmin"):
+            return self.arg_reduce(ins[0], a["axis"] % ins[0][1].rank, a["keepdims"], k)
+        if k == "dynamic_slice":
+            (x, xt), (st, stt) = ins
+            offs = self.offsets(st, stt, xt.shape, tuple(a["size"]))
+            r = self.fresh()
+            self.emit(f"{r} = tensor.extract_slice {x}[{', '.join(offs)}] [{', '.join(map(str, a['size']))}] "
+                      f"[{', '.join(['1'] * xt.rank)}] : {ttype(xt)} to {ttype(out)}")
+            return r
+        if k == "dynamic_update_slice":
+            (x, xt), (u, ut), (st, stt) = ins
+            offs = self.offsets(st, stt, xt.shape, ut.shape)
+            r = self.fresh()
+            self.emit(f"{r} = tensor.insert_slice {u} into {x}[{', '.join(offs)}] [{', '.join(map(str, ut.shape))}] "
+                      f"[{', '.join(['1'] * xt.rank)}] : {ttype(ut)} into {ttype(xt)}")
+            return r
         if k == "broadcast":
             return self.generic(out, ins, self.unary_body("copy", dt))
         if k == "reshape":
@@ -402,6 +455,22 @@ class Emitter:
             return r
         if k == "pad":
             return self.pad(ins[0][0], ins[0][1], out, [lo for lo, _ in a["pads"]], [hi for _, hi in a["pads"]], 0.0)
+        if k == "concat" and out.rank == 1 and all(t.numel == 1 for _, t in ins):
+            # Small vectors of scalars (e.g. a runtime start position [t, 0]) are built with
+            # tensor.from_elements: IREE 3.11 miscompiles tensor.concat -> extract -> extract_slice.
+            elems = []
+            for v, t in ins:
+                idx = []
+                for _ in range(t.rank):
+                    z = self.fresh()
+                    self.emit(f"{z} = arith.constant 0 : index")
+                    idx.append(z)
+                e = self.fresh()
+                self.emit(f"{e} = tensor.extract {v}[{', '.join(idx)}] : {ttype(t)}")
+                elems.append(e)
+            r = self.fresh()
+            self.emit(f"{r} = tensor.from_elements {', '.join(elems)} : {ttype(out)}")
+            return r
         if k == "concat":
             r = self.fresh()
             self.emit(f"{r} = tensor.concat dim({a['axis'] % out.rank}) {', '.join(v for v, _ in ins)} : "
@@ -463,6 +532,85 @@ class Emitter:
                       f"tensor<{s_}x{s_}x{dt}>) outs({init} : {ttype(out)}) -> {ttype(out)}")
             return r
         raise NotImplementedError(f"MLIR lowering for '{k}'")
+
+    def gather(self, table: tuple[str, TensorType], idx: tuple[str, TensorType], out: TensorType, ax: int) -> str:
+        """out[..., i..., ...] = table[..., idx[i...], ...] as a linalg.generic that reads the table directly."""
+        (tv, tt), (iv, it) = table, idx
+        if it.rank == 0:
+            # One position: a dynamic one-row slice. (IREE 3.11 can't vectorize a 0-d index gather.)
+            i, ii = self.fresh(), self.fresh()
+            self.emit(f"{i} = tensor.extract {iv}[] : {ttype(it)}")
+            self.emit(f"{ii} = arith.index_cast {i} : i32 to index")
+            offs = ["0"] * tt.rank
+            offs[ax] = ii
+            sizes = [str(d) for d in tt.shape]
+            sizes[ax] = "1"
+            row_t = TensorType(tt.dtype, tuple(1 if j == ax else d for j, d in enumerate(tt.shape)))
+            r = self.fresh()
+            self.emit(f"{r} = tensor.extract_slice {tv}[{', '.join(offs)}] [{', '.join(sizes)}] "
+                      f"[{', '.join(['1'] * tt.rank)}] : {ttype(tt)} to {ttype(row_t)}")
+            return self.reshape(r, row_t, out)
+        n = out.rank
+        idx_dims = ", ".join(f"d{ax + j}" for j in range(it.rank))
+        maps = [f"affine_map<({self.dims(n)}) -> ({idx_dims})>", f"affine_map<({self.dims(n)}) -> ({self.dims(n)})>"]
+        init = self.empty(out)
+        r = self.fresh()
+        iters = ", ".join(['"parallel"'] * n)
+        self.emit(f"{r} = linalg.generic {{indexing_maps = [{', '.join(maps)}], iterator_types = [{iters}]}} "
+                  f"ins({iv} : {ttype(it)}) outs({init} : {ttype(out)}) {{")
+        self.emit(f"^bb0(%i: i32, %o: {out.dtype}):")
+        self.emit("  %ii = arith.index_cast %i : i32 to index")
+        coords = []
+        for j in range(tt.rank):
+            if j == ax:
+                coords.append("%ii")
+            else:
+                pos = j if j < ax else j - 1 + it.rank
+                self.emit(f"  %d{j} = linalg.index {pos} : index")
+                coords.append(f"%d{j}")
+        self.emit(f"  %v = tensor.extract {tv}[{', '.join(coords)}] : {ttype(tt)}")
+        self.emit(f"  linalg.yield %v : {out.dtype}")
+        self.emit(f"}} -> {ttype(out)}")
+        return r
+
+    def arg_reduce(self, x: tuple[str, TensorType], ax: int, keepdims: bool, kind: str) -> str:
+        """argmax/argmin = reduce to the extreme value, then the smallest index that attains it.
+
+        The index reduction runs in f32 (exact below 2^24): IREE 3.11's CPU microkernel path fails
+        to compile an i32 min-reduction (`linalg.reduce` with `arith.minsi`).
+        """
+        xv, xt = x
+        best, bt = self.keep(*self.reduce(xv, xt, (ax,), "max" if kind == "argmax" else "min"), xt.shape, (ax,))
+        cand_t = TensorType("f32", xt.shape)
+        eq = "arith.cmpi eq" if is_int(xt.dtype) else "arith.cmpf oeq"
+
+        def body(args):
+            return ([f"%e = {eq}, {args[0]}, {args[1]} : {xt.dtype}", f"%p = linalg.index {ax} : index",
+                     "%pi = arith.index_cast %p : index to i32", "%pf = arith.sitofp %pi : i32 to f32",
+                     "%big = arith.constant 3.0e+38 : f32", "%r = arith.select %e, %pf, %big : f32"], "%r")
+        cand = self.generic(cand_t, [(xv, xt), (best, bt)], body)
+        r, rt = self.reduce(cand, cand_t, (ax,), "min")
+        r = self.generic(rt.with_dtype("i32"), [(r, rt)], lambda args: ([f"%r = arith.fptosi {args[0]} : f32 to i32"],
+                                                                         "%r"))
+        rt = rt.with_dtype("i32")
+        if keepdims:
+            r, rt = self.keep(r, rt, xt.shape, (ax,))
+        return r
+
+    def offsets(self, start: str, st: TensorType, shape: tuple[int, ...], size: tuple[int, ...]) -> list[str]:
+        """Runtime slice offsets read from an i32 vector and clamped into bounds (like the reference)."""
+        out = []
+        for i, (d, n) in enumerate(zip(shape, size)):
+            ci, s, lo, hi, a, b, o = (self.fresh() for _ in range(7))
+            self.emit(f"{ci} = arith.constant {i} : index")
+            self.emit(f"{s} = tensor.extract {start}[{ci}] : {ttype(st)}")
+            self.emit(f"{lo} = arith.constant 0 : i32")
+            self.emit(f"{hi} = arith.constant {d - n} : i32")
+            self.emit(f"{a} = arith.maxsi {s}, {lo} : i32")
+            self.emit(f"{b} = arith.minsi {a}, {hi} : i32")
+            self.emit(f"{o} = arith.index_cast {b} : i32 to index")
+            out.append(o)
+        return out
 
     def pad(self, v: str, t: TensorType, out: TensorType, lo: list[int], hi: list[int], value: float) -> str:
         r = self.fresh()
@@ -548,9 +696,15 @@ class Emitter:
 def emit_module(g: ir.Graph, func_name: str = "main") -> str:
     """The whole graph as one MLIR module with a single public function."""
     em = Emitter()
-    env = {v: f"%arg{i}" for i, v in enumerate(g.inputs)}
+    env = {}
+    for i, v in enumerate(g.inputs):
+        if v.type.rank == 0:   # scalars cross the module boundary as [1] (IREE drops 0-d host arrays)
+            env[v] = em.reshape(f"%arg{i}", TensorType(v.type.dtype, (1,)), v.type)
+        else:
+            env[v] = f"%arg{i}"
     outs = em.graph_body(g, env)
-    args = ", ".join(f"%arg{i}: {ttype(v.type)}" for i, v in enumerate(g.inputs))
+    args = ", ".join(f"%arg{i}: {ttype(TensorType(v.type.dtype, v.type.shape or (1,)))}"
+                     for i, v in enumerate(g.inputs))
     res = ", ".join(ttype(v.type) for v in g.outputs)
     head = ["module {", f"  func.func @{func_name}({args}) -> ({res}) {{"]
     body = em.lines + [f"    return {', '.join(outs)} : {res}", "  }", "}"]
@@ -604,7 +758,8 @@ class MLIRExecutable:
         self.vmfb_bytes = len(vmfb)
 
     def run(self, feeds: dict[ir.Value, np.ndarray]) -> dict[ir.Value, np.ndarray]:
-        args = [np.ascontiguousarray(feeds[v], dtype=v.type.np_dtype).reshape(v.type.shape) for v in self.g.inputs]
+        args = [np.ascontiguousarray(feeds[v], dtype=v.type.np_dtype).reshape(v.type.shape or (1,))
+                for v in self.g.inputs]
         res = self.fn(*args)
         res = res if isinstance(res, (tuple, list)) else [res]
         return {v: np.asarray(r.to_host() if hasattr(r, "to_host") else r).reshape(v.type.shape).astype(v.type.np_dtype)

@@ -1,0 +1,76 @@
+# A tiny GPT: one transformer block, trained and run entirely through Mira.
+#
+#   train_step  - loss and gradients for a batch of sequences (the host applies Adam)
+#   generate    - greedy decoding, one token per iteration of a data-dependent while
+#                 loop, with a fixed-size KV cache written at a runtime position
+#
+# Sizes: vocabulary V=16, model width D=32, MLP width F=64, context T=16.
+
+fn causal_mask(n: int) -> f32[n, n] {
+  # 0 where position j may attend to position i (j <= i), -10000 elsewhere
+  let allowed = reshape(arange(n), [n, 1]) >= reshape(arange(n), [1, n])
+  return (cast(allowed, f32) - 1) * 10000
+}
+
+fn block(h: f32[B, T, D], wq: f32[D, D], wk: f32[D, D], wv: f32[D, D], wo: f32[D, D],
+         w1: f32[D, F], w2: f32[F, D], g1: f32[D], b1: f32[D], g2: f32[D], b2: f32[D]) -> f32[B, T, D] {
+  let x = layernorm(h, g1, b1)
+  let scores = (x @ wq) @ transpose(x @ wk) / sqrt(D) + causal_mask(T)
+  let y = h + (softmax(scores) @ (x @ wv)) @ wo
+  return y + gelu(layernorm(y, g2, b2) @ w1) @ w2
+}
+
+fn train_step(tok: i32[32, 16],
+              emb: f32[16, 32], pos: f32[16, 32],
+              wq: f32[32, 32], wk: f32[32, 32], wv: f32[32, 32], wo: f32[32, 32],
+              w1: f32[32, 64], w2: f32[64, 32],
+              g1: f32[32], b1: f32[32], g2: f32[32], b2: f32[32], wout: f32[32, 16])
+    -> (f32[], f32[16, 32], f32[16, 32], f32[32, 32], f32[32, 32], f32[32, 32], f32[32, 32],
+        f32[32, 64], f32[64, 32], f32[32], f32[32], f32[32], f32[32], f32[32, 16]) {
+  let h = block(emb[tok] + pos, wq, wk, wv, wo, w1, w2, g1, b1, g2, b2)
+  let logits = (h @ wout)[:, 0:15]                       # predictions for positions 1..15
+  let z = logits - max(logits, axis=2, keepdims=true)
+  let log_probs = z - log(sum(exp(z), axis=2, keepdims=true))
+  let target = reshape(tok[:, 1:], [32, 15, 1]) == reshape(arange(16), [1, 1, 16])
+  let loss = -sum(cast(target, f32) * log_probs) / (32 * 15)
+  return loss, grad(loss, emb), grad(loss, pos), grad(loss, wq), grad(loss, wk), grad(loss, wv),
+         grad(loss, wo), grad(loss, w1), grad(loss, w2), grad(loss, g1), grad(loss, b1), grad(loss, g2),
+         grad(loss, b2), grad(loss, wout)
+}
+
+fn generate(prompt: i32[5],
+            const emb: f32[16, 32], const pos: f32[16, 32],
+            const wq: f32[32, 32], const wk: f32[32, 32], const wv: f32[32, 32], const wo: f32[32, 32],
+            const w1: f32[32, 64], const w2: f32[64, 32],
+            const g1: f32[32], const b1: f32[32], const g2: f32[32], const b2: f32[32],
+            const wout: f32[32, 16]) -> i32[16] {
+  let tokens = zeros([16], i32)
+  tokens[0:5] = prompt
+  let kcache = zeros([16, 32])          # fixed size: the shapes never change, only the position t
+  let vcache = zeros([16, 32])
+  let t = zeros([], i32)
+  while t < 15 {
+    let h = reshape(emb[tokens[t]], [1, 32]) + dynamic_slice(pos, [t, 0], [1, 32])
+    let x = layernorm(h, g1, b1)
+    kcache[t] = reshape(x @ wk, [32])
+    vcache[t] = reshape(x @ wv, [32])
+    let seen = cast(reshape(arange(16), [1, 16]) <= t, f32)      # only cache rows 0..t are valid
+    let scores = (x @ wq) @ transpose(kcache) / sqrt(32) + (seen - 1) * 10000
+    h = h + (softmax(scores) @ vcache) @ wo
+    h = h + gelu(layernorm(h, g2, b2) @ w1) @ w2
+    let next = argmax(h @ wout, axis=1)[0]
+    tokens[t + 1] = where(t + 1 < 5, tokens[t + 1], next)     # keep the prompt, then predict
+    t = t + 1
+  }
+  return tokens
+}
+
+fn forward(tok: i32[1, 16],
+           const emb: f32[16, 32], const pos: f32[16, 32],
+           const wq: f32[32, 32], const wk: f32[32, 32], const wv: f32[32, 32], const wo: f32[32, 32],
+           const w1: f32[32, 64], const w2: f32[64, 32],
+           const g1: f32[32], const b1: f32[32], const g2: f32[32], const b2: f32[32],
+           const wout: f32[32, 16]) -> f32[1, 16, 16] {
+  # Full-sequence logits (no cache): what generate() must agree with, position by position
+  return block(emb[tok] + pos, wq, wk, wv, wo, w1, w2, g1, b1, g2, b2) @ wout
+}

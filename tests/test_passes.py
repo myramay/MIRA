@@ -73,8 +73,8 @@ def test_fusion_skips_multi_use_results():
 
 
 def test_every_example_is_preserved_by_optimization(tmp_path):
-    import glob
-    for path in sorted(glob.glob("examples/*.mira")):
+    from conftest import MAIN_EXAMPLES
+    for path in MAIN_EXAMPLES:
         src = open(path).read()
         g0 = elaborate(parse(src), seed=0)
         g1 = copy.deepcopy(g0)

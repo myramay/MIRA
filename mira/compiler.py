@@ -279,9 +279,18 @@ def compile_source(source: str, target: str = "cpu", *, filename: str = "<input>
     except MiraError as e:
         e.source = source
         raise
+    return compile_ir(graph, target, optimize=optimize, fuse=fuse, precision=precision, cost_model=cost_model,
+                      quantize=quantize, started=t0, **target_options)
+
+
+def compile_ir(graph: ir.Graph, target: str = "cpu", *, optimize: bool = True, fuse: bool = True,
+               precision: Optional[str] = "auto", cost_model: bool = True, quantize: Optional[str] = None,
+               started: Optional[float] = None, **target_options) -> CompiledProgram:
+    """The back half of the compiler, shared by every front end: optimize, quantize, partition, compile."""
+    t0 = started if started is not None else time.perf_counter()
     if precision == "auto":
         precision = None if target == "cpu" else "f16"
-    log: list[tuple[str, str]] = [("elaborate", str(graph))]
+    log: list[tuple[str, str]] = [("input", str(graph))]
     if optimize:
         passes.optimize(graph, fuse=fuse, precision=precision, log=log)
     elif precision == "f16":
@@ -293,9 +302,55 @@ def compile_source(source: str, target: str = "cpu", *, filename: str = "<input>
     return CompiledProgram(target, runner, log, time.perf_counter() - t0)
 
 
-def compile_file(path: str, target: str = "cpu", **kw) -> Union[CompiledProgram, DynamicProgram]:
+class ShapeSpecialized:
+    """Compiles a model once per distinct set of input shapes (for models with symbolic dimensions)."""
+
+    def __init__(self, build, input_names: list[str]):
+        self.build = build
+        self.input_names = input_names
+        self.cache: dict[tuple, CompiledProgram] = {}
+
+    @property
+    def specializations(self) -> list[dict[str, tuple[int, ...]]]:
+        return [dict(k) for k in self.cache]
+
+    def run(self, inputs: dict[str, np.ndarray]):
+        key = tuple((n, tuple(np.shape(inputs[n]))) for n in self.input_names if n in inputs)
+        if key not in self.cache:
+            self.cache[key] = self.build(dict(key))
+        return self.cache[key].run(inputs)
+
+    def __call__(self, **inputs: np.ndarray):
+        return self.run(inputs)
+
+
+def compile_onnx(model, target: str = "cpu", *, input_shapes: Optional[dict[str, tuple[int, ...]]] = None,
+                 **kw) -> Union[CompiledProgram, ShapeSpecialized]:
+    """Import an ONNX model (path, bytes or ModelProto) and compile it for `target`.
+
+    Inputs with symbolic dimensions (like a dynamic batch size) give a ShapeSpecialized
+    program that compiles once per input shape seen, unless `input_shapes` pins them.
+    """
+    from .frontends.onnx_import import import_onnx, onnx_inputs
+    t0 = time.perf_counter()
+    shapes = dict(input_shapes or {})
+    inputs = onnx_inputs(model)
+    if any(None in dims and name not in shapes for name, dims, _ in inputs):
+        return ShapeSpecialized(lambda s: compile_onnx(model, target, input_shapes={**shapes, **s}, **kw),
+                                [name for name, _, _ in inputs])
+    graph = import_onnx(model, shapes)
+    return compile_ir(graph, target, started=t0, **kw)
+
+
+def compile_file(path: str, target: str = "cpu", **kw) -> Union[CompiledProgram, DynamicProgram, ShapeSpecialized]:
+    """Compile a .mira source file, or import and compile an .onnx model."""
+    if path.endswith(".onnx"):
+        for k in ("entry", "weights", "dims", "seed", "dynamic", "buckets", "filename"):
+            kw.pop(k, None)
+        return compile_onnx(path, target, **kw)
     with open(path) as f:
         return compile_source(f.read(), target, filename=path, **kw)
 
 
-__all__ = ["compile_source", "compile_file", "CompiledProgram", "DynamicProgram", "GraphRunner"]
+__all__ = ["compile_source", "compile_file", "compile_onnx", "compile_ir", "CompiledProgram", "DynamicProgram",
+           "ShapeSpecialized", "GraphRunner"]

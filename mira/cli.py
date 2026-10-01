@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from .backends import TARGETS
-from .compiler import CompiledProgram, DynamicProgram, compile_file
+from .compiler import CompiledProgram, DynamicProgram, ShapeSpecialized, compile_file
 from .errors import MiraError
 
 STAGES = ["tokens", "ast", "ir", "opt", "passes", "partition", "asm", "timeline", "mlir"]
@@ -37,12 +37,29 @@ def _load_npz(path):
         return {k: z[k] for k in z.files}
 
 
+def _shapes(items: list[str]) -> dict[str, tuple[int, ...]]:
+    out = {}
+    for it in items or []:
+        name, _, dims = it.rpartition("=")
+        if not name:
+            raise SystemExit(f"--shape expects NAME=D0,D1,..., got {it!r}")
+        out[name] = tuple(int(d) for d in dims.split(",") if d)
+    return out
+
+
 def _compile(args, target: str) -> CompiledProgram:
+    extra = {"input_shapes": _shapes(args.shape)} if args.file.endswith(".onnx") else {}
     prog = compile_file(args.file, target, entry=args.entry, weights=_load_npz(args.weights), dims=_dims(args.dim),
                         seed=args.seed, optimize=not args.O0, fuse=not args.no_fuse, units=args.units,
                         double_buffer=not args.no_double_buffer, precision=args.precision,
                         cost_model=not args.no_cost_model, quantize=args.quantize, sim_fast=args.sim_fast,
-                        sim_config=dict(kv.split("=", 1) for kv in args.sim or []), mlir_backend=args.mlir_backend)
+                        sim_config=dict(kv.split("=", 1) for kv in args.sim or []), mlir_backend=args.mlir_backend,
+                        **extra)
+    if isinstance(prog, ShapeSpecialized):
+        from .frontends.onnx_import import onnx_inputs
+        dyn = [f"{n}={dims}" for n, dims, _ in onnx_inputs(args.file) if None in dims]
+        raise MiraError(f"the model has inputs with symbolic dimensions ({'; '.join(dyn)}); pin them with --shape, "
+                        f"e.g. --shape {dyn[0].split('=')[0]}=1,...")
     if isinstance(prog, DynamicProgram):
         syms = sorted({d for p in prog.fn.params for d in p.type.dims if isinstance(d, str)}
                       | {p.name for p in prog.fn.params if p.type.is_int} - set(_dims(args.dim)))
@@ -99,13 +116,15 @@ def cmd_emit(args) -> int:
     from .lexer import tokenize
     from .parser import parse
 
-    src = open(args.file).read()
-    if args.stage == "tokens":
-        for t in tokenize(src, args.file):
-            print(f"{t.loc.line:4d}:{t.loc.col:<4d} {t.kind:<8} {t.text}")
-        return 0
-    if args.stage == "ast":
-        print(syntax.format_module(parse(src, args.file)))
+    if args.stage in ("tokens", "ast"):
+        if args.file.endswith(".onnx"):
+            raise MiraError(f"'{args.stage}' is a Mira source stage; ONNX models start at the 'ir' stage")
+        src = open(args.file).read()
+        if args.stage == "tokens":
+            for t in tokenize(src, args.file):
+                print(f"{t.loc.line:4d}:{t.loc.col:<4d} {t.kind:<8} {t.text}")
+        else:
+            print(syntax.format_module(parse(src, args.file)))
         return 0
     prog = _compile(args, args.target)
     if args.stage == "ir":
@@ -190,6 +209,8 @@ def main(argv=None) -> int:
         p.add_argument("--weights", help=".npz with values for const parameters (default: random)")
         p.add_argument("--inputs", help=".npz with runtime inputs (default: random)")
         p.add_argument("--dim", action="append", help="bind a shape symbol or int parameter, e.g. --dim B=32")
+        p.add_argument("--shape", action="append", metavar="NAME=D0,D1,...",
+                       help="ONNX models: input shape for an input with symbolic dims, e.g. --shape x=1,3,224,224")
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--precision", default="auto", choices=["auto", "f16", "none"])
         p.add_argument("--units", default="ne", choices=["ne", "all", "gpu", "cpu"], help="Core ML compute units")

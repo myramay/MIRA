@@ -16,7 +16,7 @@ from typing import Callable
 
 import numpy as np
 
-from .types import NP_DTYPES, TensorType
+from .types import NP_DTYPES, TensorType, type_of_array
 
 
 class OpTypeError(Exception):
@@ -67,6 +67,17 @@ def broadcast_shapes(a: tuple[int, ...], b: tuple[int, ...], op: str) -> tuple[i
     return tuple(reversed(out))
 
 
+def need_float(types: list[TensorType], op: str) -> None:
+    for t in types:
+        if not t.is_float:
+            raise OpTypeError(f"{op}: needs floating-point operands, got {t}; use cast(x, f32)")
+
+
+def need_int(t: TensorType, op: str, what: str = "indices") -> None:
+    if t.dtype != "i32":
+        raise OpTypeError(f"{op}: {what} must be i32, got {t}")
+
+
 def norm_axis(axis: int, rank: int, op: str) -> int:
     if not -rank <= axis < rank:
         raise OpTypeError(f"{op}: axis {axis} is out of range for a rank-{rank} tensor")
@@ -75,10 +86,7 @@ def norm_axis(axis: int, rank: int, op: str) -> int:
 
 # ---------------------------------------------------------------- const
 
-register("const", "const",
-         lambda ts, a: TensorType({np.dtype(np.float16): "f16", np.dtype(np.float32): "f32"}[a["value"].dtype],
-                                  tuple(a["value"].shape)),
-         lambda xs, a: a["value"])
+register("const", "const", lambda ts, a: type_of_array(a["value"]), lambda xs, a: a["value"])
 
 
 # ---------------------------------------------------------------- elementwise
@@ -99,7 +107,22 @@ UNARY: dict[str, Callable[[np.ndarray], np.ndarray]] = {
     "abs": np.abs,
     "neg": np.negative,
     "sign": np.sign,
+    "erf": None,          # filled in below
 }
+
+
+def _erf(x):
+    # Abramowitz & Stegun 7.1.26: |error| < 1.5e-7, plenty for fp32/fp16
+    s = np.sign(x)
+    a = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * a)
+    y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t \
+        * np.exp(-a * a)
+    return s * y
+
+
+UNARY["erf"] = _erf
+INT_UNARY = {"relu", "neg", "abs", "sign"}            # unary ops that also work on i32
 
 BINARY: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "add": np.add,
@@ -115,26 +138,38 @@ BINARY: dict[str, Callable[[np.ndarray, np.ndarray], np.ndarray]] = {
     "equal": np.equal,
 }
 COMPARISONS = {"greater", "greater_equal", "equal"}
+FLOAT_ONLY_BINARY = {"div", "pow"}
 
 
-def _unary_infer(ts, a):
-    return ts[0]
+def _unary_infer_named(name):
+    def infer(ts, a):
+        if name not in INT_UNARY:
+            need_float(ts, name)
+        return ts[0]
+    return infer
 
 
 def _binary_infer_named(name):
     def infer(ts, a):
         dt = same_dtype(ts, name)
+        if name in FLOAT_ONLY_BINARY:
+            need_float(ts, name)
         return TensorType(dt, broadcast_shapes(ts[0].shape, ts[1].shape, name))
     return infer
 
 
+def _native_or_f32(x: np.ndarray) -> np.ndarray:
+    """Floats compute in fp32 (like NPU accumulators); integers stay exact."""
+    return x if x.dtype.kind == "i" else f32(x)
+
+
 for _n, _f in UNARY.items():
-    register(_n, "unary", _unary_infer,
-             (lambda f: lambda xs, a: f(f32(xs[0])).astype(xs[0].dtype))(_f))
+    register(_n, "unary", _unary_infer_named(_n),
+             (lambda f: lambda xs, a: f(_native_or_f32(xs[0])).astype(xs[0].dtype))(_f))
 
 for _n, _f in BINARY.items():
     register(_n, "binary", _binary_infer_named(_n),
-             (lambda f: lambda xs, a: f(f32(xs[0]), f32(xs[1])).astype(xs[0].dtype))(_f))
+             (lambda f: lambda xs, a: f(_native_or_f32(xs[0]), _native_or_f32(xs[1])).astype(xs[0].dtype))(_f))
 
 
 # ---------------------------------------------------------------- epilogues
@@ -169,6 +204,7 @@ def epilogue_ref(acc: np.ndarray, xs: list[np.ndarray], epilogue) -> np.ndarray:
 def _matmul_infer(ts, a):
     x, w = ts[0], ts[1]
     dt = same_dtype([x, w], "matmul")
+    need_float([x], "matmul")
     if x.rank < 2 or w.rank < 2:
         raise OpTypeError(f"matmul: both operands need rank >= 2, got {x} @ {w}")
     if x.shape[-1] != w.shape[-2]:
@@ -195,6 +231,7 @@ def _conv_out(size, k, stride, pad):
 def _conv2d_infer(ts, a):
     x, w = ts[0], ts[1]
     dt = same_dtype([x, w], "conv2d")
+    need_float([x], "conv2d")
     if x.rank != 4 or w.rank != 4:
         raise OpTypeError(f"conv2d: expects input [N, C, H, W] and weight [O, C, KH, KW], got {x} and {w}")
     n, c, h, wd = x.shape
@@ -245,6 +282,7 @@ register("maxpool2d", "pool", _maxpool_infer, _maxpool_ref)
 # ---------------------------------------------------------------- softmax / reductions / norms
 
 def _softmax_infer(ts, a):
+    need_float(ts, "softmax")
     norm_axis(a["axis"], ts[0].rank, "softmax")
     return ts[0]
 
@@ -263,6 +301,8 @@ REDUCE = {"reduce_sum": np.sum, "reduce_mean": np.mean, "reduce_max": np.max}
 def _reduce_infer_named(name):
     def infer(ts, a):
         x = ts[0]
+        if name == "reduce_mean":
+            need_float(ts, name)
         axes = sorted(norm_axis(ax, x.rank, name) for ax in a["axes"])
         if a["keepdims"]:
             shape = tuple(1 if i in axes else d for i, d in enumerate(x.shape))
@@ -272,15 +312,21 @@ def _reduce_infer_named(name):
     return infer
 
 
+def _reduce_ref_named(f):
+    def ref(xs, a):
+        out = f(_native_or_f32(xs[0]), axis=tuple(a["axes"]), keepdims=a["keepdims"])
+        return np.asarray(out).astype(xs[0].dtype)
+    return ref
+
+
 for _n, _f in REDUCE.items():
-    register(_n, "reduce", _reduce_infer_named(_n),
-             (lambda f: lambda xs, a: np.asarray(f(f32(xs[0]), axis=tuple(a["axes"]), keepdims=a["keepdims"]))
-              .astype(xs[0].dtype))(_f))
+    register(_n, "reduce", _reduce_infer_named(_n), _reduce_ref_named(_f))
 
 
 def _layernorm_infer(ts, a):
     x, g, b = ts
     same_dtype(ts, "layernorm")
+    need_float([x], "layernorm")
     d = x.shape[-1]
     if g.shape != (d,) or b.shape != (d,):
         raise OpTypeError(f"layernorm: gamma and beta must be [{d}] to match the last axis of {x}, got {g} and {b}")
@@ -358,7 +404,7 @@ register("cumprod", "misc", _axis_infer_named("cumprod"),
 # ---------------------------------------------------------------- selection and data movement
 
 def _where_infer(ts, a):
-    dt = same_dtype(ts, "where")
+    dt = same_dtype(ts[1:], "where")      # the condition may be any dtype (nonzero = true)
     shape = broadcast_shapes(broadcast_shapes(ts[0].shape, ts[1].shape, "where"), ts[2].shape, "where")
     return TensorType(dt, shape)
 
@@ -401,6 +447,112 @@ def _pad_infer(ts, a):
 
 
 register("pad", "shape", _pad_infer, lambda xs, a: np.pad(xs[0], a["pads"]))
+
+
+# ---------------------------------------------------------------- integer indexing
+
+def _gather_infer(ts, a):
+    table, idx = ts
+    need_int(idx, "gather")
+    ax = norm_axis(a["axis"], table.rank, "gather")
+    return TensorType(table.dtype, table.shape[:ax] + idx.shape + table.shape[ax + 1:])
+
+
+def _gather_ref(xs, a):
+    table, idx = xs
+    n = table.shape[a["axis"]]
+    if idx.size and (idx.min() < -n or idx.max() >= n):
+        raise IndexError(f"gather: index out of range for an axis of size {n}")
+    return np.take(table, idx, axis=a["axis"])
+
+
+register("gather", "index", _gather_infer, _gather_ref)
+
+
+def _scatter_add_infer(ts, a):
+    base, idx, upd = ts
+    need_int(idx, "scatter_add")
+    ax = norm_axis(a["axis"], base.rank, "scatter_add")
+    want = base.shape[:ax] + idx.shape + base.shape[ax + 1:]
+    if upd.shape != want or upd.dtype != base.dtype:
+        raise OpTypeError(f"scatter_add: updates must be {TensorType(base.dtype, want)}, got {upd}")
+    return base
+
+
+def _scatter_add_ref(xs, a):
+    """out = base; out[..., idx[k], ...] += updates[..., k, ...] (repeated indices accumulate)."""
+    base, idx, upd = xs
+    ax = a["axis"] % base.ndim
+    out = _native_or_f32(base).copy()
+    moved = np.moveaxis(out, ax, 0)                                 # a view with the axis first
+    u = np.moveaxis(_native_or_f32(upd).reshape(base.shape[:ax] + (idx.size,) + base.shape[ax + 1:]), ax, 0)
+    np.add.at(moved, idx.ravel(), u)
+    return out.astype(base.dtype)
+
+
+register("scatter_add", "index", _scatter_add_infer, _scatter_add_ref)
+
+
+def _arg_infer_named(name):
+    def infer(ts, a):
+        x = ts[0]
+        ax = norm_axis(a["axis"], x.rank, name)
+        shape = tuple(1 if i == ax else d for i, d in enumerate(x.shape)) if a["keepdims"] else \
+            tuple(d for i, d in enumerate(x.shape) if i != ax)
+        return TensorType("i32", shape)
+    return infer
+
+
+register("argmax", "reduce", _arg_infer_named("argmax"),
+         lambda xs, a: np.asarray(np.argmax(xs[0], axis=a["axis"], keepdims=a["keepdims"])).astype(np.int32))
+register("argmin", "reduce", _arg_infer_named("argmin"),
+         lambda xs, a: np.asarray(np.argmin(xs[0], axis=a["axis"], keepdims=a["keepdims"])).astype(np.int32))
+
+
+# ---------------------------------------------------------------- slices at runtime positions
+# Like XLA: the start position is a runtime i32 vector (one entry per axis), clamped so the
+# slice stays in bounds. This is how fixed-size buffers (KV caches, token buffers) are read
+# and written at a position only known while the program runs.
+
+def _clamped_starts(start: np.ndarray, shape, size) -> list[int]:
+    return [int(min(max(int(s), 0), d - n)) for s, d, n in zip(start.ravel(), shape, size)]
+
+
+def _dyn_slice_infer(ts, a):
+    x, start = ts
+    need_int(start, "dynamic_slice", "start")
+    size = tuple(a["size"])
+    if start.shape != (x.rank,) or len(size) != x.rank or any(n > d or n < 0 for n, d in zip(size, x.shape)):
+        raise OpTypeError(f"dynamic_slice: need start i32[{x.rank}] and a size that fits in {x}")
+    return TensorType(x.dtype, size)
+
+
+def _dyn_slice_ref(xs, a):
+    x, start = xs
+    st = _clamped_starts(start, x.shape, a["size"])
+    return x[tuple(slice(s, s + n) for s, n in zip(st, a["size"]))].copy()
+
+
+def _dyn_update_infer(ts, a):
+    x, upd, start = ts
+    need_int(start, "dynamic_update_slice", "start")
+    if upd.dtype != x.dtype or upd.rank != x.rank or any(n > d for n, d in zip(upd.shape, x.shape)):
+        raise OpTypeError(f"dynamic_update_slice: update {upd} doesn't fit in {x}")
+    if start.shape != (x.rank,):
+        raise OpTypeError(f"dynamic_update_slice: start must be i32[{x.rank}], got {start}")
+    return x
+
+
+def _dyn_update_ref(xs, a):
+    x, upd, start = xs
+    st = _clamped_starts(start, x.shape, upd.shape)
+    out = x.copy()
+    out[tuple(slice(s, s + n) for s, n in zip(st, upd.shape))] = upd
+    return out
+
+
+register("dynamic_slice", "index", _dyn_slice_infer, _dyn_slice_ref)
+register("dynamic_update_slice", "index", _dyn_update_infer, _dyn_update_ref)
 
 
 # ---------------------------------------------------------------- quantized constants

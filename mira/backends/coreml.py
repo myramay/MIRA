@@ -22,14 +22,20 @@ import numpy as np
 from .. import ir
 
 _UNARY = {"relu": "relu", "sigmoid": "sigmoid", "tanh": "tanh", "exp": "exp", "log": "log", "sqrt": "sqrt",
-          "abs": "abs", "sign": "sign"}
+          "abs": "abs", "sign": "sign", "erf": "erf"}
+MIL_DTYPE = {"f16": "fp16", "f32": "fp32", "i32": "int32"}
+# ops lowered for i32 tensors (others with integer operands fall back to the CPU)
+INT_OK = {"add", "sub", "mul", "maximum", "minimum", "neg", "greater", "greater_equal", "equal", "where", "cast",
+          "reshape", "transpose", "slice", "concat", "broadcast", "reduce_sum", "reduce_max", "gather", "argmax",
+          "argmin", "dynamic_slice", "dynamic_update_slice", "scatter_add", "pad"}
 _COMPARE = {"greater": "greater", "greater_equal": "greater_equal", "equal": "equal"}
 _BINARY = {"add": "add", "sub": "sub", "mul": "mul", "div": "real_div", "pow": "pow",
            "maximum": "maximum", "minimum": "minimum"}
 _REDUCE = {"reduce_sum": "reduce_sum", "reduce_mean": "reduce_mean", "reduce_max": "reduce_max"}
 SUPPORTED = set(_UNARY) | set(_BINARY) | set(_REDUCE) | set(_COMPARE) | {
     "neg", "gelu", "matmul", "conv2d", "maxpool2d", "softmax", "transpose", "reshape", "concat", "layernorm", "cast",
-    "where", "broadcast", "slice", "pad", "dequantize"}
+    "where", "broadcast", "slice", "pad", "dequantize", "gather", "argmax", "argmin", "scatter_add",
+    "dynamic_slice", "dynamic_update_slice"}
 
 COMPUTE_UNITS = {"ne": "CPU_AND_NE", "all": "ALL", "gpu": "CPU_AND_GPU", "cpu": "CPU_ONLY"}
 
@@ -65,6 +71,7 @@ def capture_native_output(sink: list[str]):
 
 
 ANE_FAILURE = "ANECCompile() FAILED"
+KEEP_INPUTS = 4      # see CoreMLExecutable.run
 
 
 def _quiet():
@@ -83,7 +90,7 @@ class CoreMLExecutable:
 
         self.g = g
         self.units = units
-        mdt = {"f16": mtypes.fp16, "f32": mtypes.fp32}
+        mdt = {"f16": mtypes.fp16, "f32": mtypes.fp32, "i32": mtypes.int32}
         specs, self.in_names = {}, {}
         for i, v in enumerate(g.inputs):
             name = f"in{i}"
@@ -92,7 +99,10 @@ class CoreMLExecutable:
         self.out_names = {v: f"out{i}" for i, v in enumerate(g.outputs)}
 
         with Function(specs, opset_version=ct.target.macOS15) as func:
-            env: dict[ir.Value, object] = {v: func.inputs[self.in_names[v]] for v in g.inputs}
+            env: dict[ir.Value, object] = {}
+            for v in g.inputs:   # Core ML inputs have rank >= 1; scalars come in as [1] and are squeezed
+                inp = func.inputs[self.in_names[v]]
+                env[v] = mb.squeeze(x=inp) if v.type.rank == 0 else inp
             for op in g.ops:
                 if op.is_const:
                     env[op.result] = op.attrs["value"]
@@ -107,8 +117,8 @@ class CoreMLExecutable:
         prog = Program()
         prog.add_function("main", func)
 
-        precision = ct.precision.FLOAT16 if all(op.result.type.dtype == "f16" for op in g.compute_ops()) \
-            else ct.precision.FLOAT32
+        floats = [op.result.type.dtype for op in g.compute_ops() if op.result.type.is_float]
+        precision = ct.precision.FLOAT16 if all(d == "f16" for d in floats) else ct.precision.FLOAT32
         self.native_log: list[str] = []
         with capture_native_output(self.native_log):
             self.model = ct.convert(prog, convert_to="mlprogram",
@@ -117,6 +127,7 @@ class CoreMLExecutable:
                                     compute_precision=precision)
             self.placement = self._compute_plan(ct)
         self.warmed_up = False
+        self._recent_inputs: list[dict[str, np.ndarray]] = []
 
     # ----- IR op -> MIL ops
 
@@ -132,11 +143,11 @@ class CoreMLExecutable:
             return mb.gelu(x=x[0], mode="TANH_APPROXIMATION", name=name)
         if k in _BINARY:
             return getattr(mb, _BINARY[k])(x=x[0], y=x[1], name=name)
-        mil_dt = {"f16": "fp16", "f32": "fp32"}[op.result.type.dtype]
+        mil_dt = MIL_DTYPE[op.result.type.dtype]
         if k in _COMPARE:     # MIL comparisons return bool; Mira's are 1.0 / 0.0
             return mb.cast(x=getattr(mb, _COMPARE[k])(x=x[0], y=x[1]), dtype=mil_dt, name=name)
         if k == "where":
-            cond = mb.not_equal(x=x[0], y=np_dt(0))
+            cond = mb.not_equal(x=x[0], y=op.inputs[0].type.np_dtype(0))
             return mb.select(cond=cond, a=x[1], b=x[2], name=name)
         if k == "broadcast":
             shape = tuple(a["shape"])
@@ -162,11 +173,31 @@ class CoreMLExecutable:
         if k == "transpose":
             return mb.transpose(x=x[0], perm=list(a["perm"]), name=name)
         if k == "reshape":
-            return mb.reshape(x=x[0], shape=list(a["shape"]), name=name)
+            return mb.reshape(x=x[0], shape=np.array(a["shape"], dtype=np.int32), name=name)
         if k == "concat":
             return mb.concat(values=x, axis=a["axis"], name=name)
         if k == "cast":
-            return mb.cast(x=x[0], dtype={"f16": "fp16", "f32": "fp32"}[a["dtype"]], name=name)
+            return mb.cast(x=x[0], dtype=MIL_DTYPE[a["dtype"]], name=name)
+        if k == "gather":
+            return mb.gather(x=x[0], indices=x[1], axis=a["axis"], name=name)
+        if k in ("argmax", "argmin"):
+            return getattr(mb, f"reduce_{k}")(x=x[0], axis=a["axis"], keep_dims=a["keepdims"], name=name)
+        if k == "scatter_add":     # MIL scatter takes 1-D indices: flatten them and the matching update axes
+            base, idx, upd = op.inputs
+            ax = a["axis"] % base.type.rank
+            flat_upd = base.type.shape[:ax] + (idx.type.numel,) + base.type.shape[ax + 1:]
+            return mb.scatter(data=x[0], indices=mb.reshape(x=x[1], shape=[idx.type.numel]),
+                              updates=mb.reshape(x=x[2], shape=list(flat_upd)), axis=ax, mode="add", name=name)
+        if k in ("dynamic_slice", "dynamic_update_slice"):
+            src = op.inputs[0].type.shape
+            size = tuple(a["size"]) if k == "dynamic_slice" else op.inputs[1].type.shape
+            start = x[1] if k == "dynamic_slice" else x[2]
+            hi = np.array([d - n for d, n in zip(src, size)], dtype=np.int32)
+            begin = mb.minimum(x=mb.maximum(x=start, y=np.int32(0)), y=hi)      # clamp, like the reference
+            if k == "dynamic_slice":
+                return mb.slice_by_size(x=x[0], begin=begin, size=list(size), name=name)
+            end = mb.add(x=begin, y=np.array(size, dtype=np.int32))
+            return mb.slice_update(x=x[0], update=x[1], begin=begin, end=end, name=name)
         if k == "layernorm":
             return mb.layer_norm(x=x[0], axes=[-1], gamma=x[1], beta=x[2], epsilon=np_dt(a["eps"]), name=name)
         if k == "maxpool2d":
@@ -235,6 +266,13 @@ class CoreMLExecutable:
     def run(self, feeds: dict[ir.Value, np.ndarray]) -> dict[ir.Value, np.ndarray]:
         inputs = {self.in_names[v]: np.ascontiguousarray(arr.reshape(v.type.shape or (1,)), dtype=v.type.np_dtype)
                   for v, arr in feeds.items()}
+        # Core ML keeps the NumPy-backed input buffers of the last prediction and, after the model
+        # sits idle, releases them on its own background thread without Python's GIL, which crashes
+        # the interpreter (MLE5ExecutionStream resetAfterLingering -> array_dealloc). Holding our
+        # own references to the last few inputs means Core ML never drops the final one; we free
+        # them later, here, on a Python thread.
+        self._recent_inputs.append(inputs)
+        del self._recent_inputs[:-KEEP_INPUTS]
         if not self.warmed_up:      # the ANE program is built on first use; catch its failures too
             with capture_native_output(self.native_log):
                 res = self.model.predict(inputs)
@@ -270,6 +308,9 @@ class CoreMLTarget:
             return f"{op.kind}: no Core ML (MIL) equivalent"
         if any(v.type.rank > 5 for v in op.inputs) or op.result.type.rank > 5:
             return "Core ML supports tensors of rank <= 5"
+        uses_int = any(not v.type.is_float for v in op.inputs) or not op.result.type.is_float
+        if uses_int and op.kind not in INT_OK:
+            return f"{op.kind} on i32: not lowered to Core ML"
         def is_const(v: ir.Value) -> bool:
             return v.producer is not None and v.producer.is_constant_like
 
