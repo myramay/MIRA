@@ -33,6 +33,7 @@ GELU_K = 0.044715
 
 UNSUPPORTED = {"sort", "cumprod", "conv2d_grad_input", "conv2d_grad_weight", "maxpool2d_grad", "scatter_add"}
 I32_MAX, I32_MIN = 2**31 - 1, -2**31
+F32_MATH = {"exp", "log", "sqrt", "tanh", "sigmoid", "gelu", "erf", "pow", "div"}   # computed in fp32 for fp16
 
 
 def is_int(dt: str) -> bool:
@@ -205,7 +206,28 @@ class Emitter:
 
     # ----- scalar bodies
 
+    def widened(self, inner, n_args: int):
+        """Run an fp32 scalar body on fp16 values: extend the arguments, compute, round once at the end.
+
+        Matches the reference semantics (fp32 math, fp16 storage). It also matters for accuracy: on
+        x86, which has no native fp16 arithmetic, IREE's fp16 lowerings of tanh/exp/... lose far more
+        precision than computing in fp32 (the fuzzer found 6% error on GitHub's x86 runners).
+        """
+        def body(a):
+            lines, wide = [], []
+            for x in a[:n_args]:
+                w = self.fresh().replace("%t", "%s")
+                lines.append(f"{w} = arith.extf {x} : f16 to f32")
+                wide.append(w)
+            more, r = inner(wide)
+            out = self.fresh().replace("%t", "%s")
+            return lines + more + [f"{out} = arith.truncf {r} : f32 to f16"], out
+        return body
+
     def unary_body(self, kind: str, dt: str):
+        if dt == "f16" and kind in F32_MATH:
+            return self.widened(self.unary_body(kind, "f32"), 1)
+
         def body(a):
             x = a[0]
             L: list[str] = []
@@ -261,6 +283,8 @@ class Emitter:
         return body
 
     def binary_body(self, kind: str, dt: str):
+        if dt == "f16" and kind in F32_MATH:
+            return self.widened(self.binary_body(kind, "f32"), 2)
         simple = {"add": "arith.addf", "sub": "arith.subf", "mul": "arith.mulf", "div": "arith.divf",
                   "pow": "math.powf", "maximum": "arith.maximumf", "minimum": "arith.minimumf"}
         preds = {"greater": "ogt", "greater_equal": "oge", "equal": "oeq"}
