@@ -195,3 +195,42 @@ def test_quantize_array_roundtrip():
     q, scale = quantize_array(w, axis=1)
     assert q.dtype == np.int8 and scale.shape == (32,)
     assert np.abs(q * scale - w).max() <= scale.max() / 2 + 1e-6
+
+
+# ------------------------------------------------------------------ W8A8: int8 weights and int8 math
+
+W8A8_CASES = [("examples/mlp.mira", "x", (64, 784), 0.9), ("examples/cnn.mira", "img", (16, 1, 28, 28), 0.9)]
+
+
+@pytest.mark.parametrize("path,name,shape,agree", W8A8_CASES)
+def test_w8a8_is_accurate(path, name, shape, agree):
+    feeds = {name: np.random.default_rng(0).standard_normal(shape).astype(np.float32)}
+    ref = mira.compile_file(path, "cpu").run(feeds)
+    q = mira.compile_file(path, "cpu", quantize="w8a8")
+    assert {"qmatmul", "qconv2d"} & {op.kind for op in q.graph.ops}
+    got = q.run(feeds)
+    assert (got.argmax(1) == ref.argmax(1)).mean() >= agree
+    assert np.abs(got - ref).max() < 0.1 * np.abs(ref).max()
+
+
+@pytest.mark.parametrize("target", ACCEL)
+@pytest.mark.parametrize("path,name,shape,agree", W8A8_CASES)
+def test_w8a8_targets_match_cpu(path, name, shape, agree, target):
+    feeds = {name: np.random.default_rng(1).standard_normal(shape).astype(np.float32)}
+    calib = [{name: np.random.default_rng(s).standard_normal(shape).astype(np.float32)} for s in (2, 3)]
+    want = mira.compile_file(path, "cpu", quantize="w8a8", calibration=calib, precision="f16").run(feeds)
+    p = mira.compile_file(path, target, quantize="w8a8", calibration=calib)
+    got = p.run(feeds)
+    assert np.abs(got - want).max() < 3e-2 * np.abs(want).max() + 1e-3, target
+    assert (got.argmax(1) == want.argmax(1)).mean() >= 0.95
+
+
+def test_w8a8_doubles_npu_sim_matrix_throughput():
+    x = {"x": np.random.default_rng(0).standard_normal((64, 784)).astype(np.float32)}
+    stats = []
+    for q in (None, "w8a8"):
+        p = mira.compile_file("examples/mlp.mira", "npu-sim", quantize=q)
+        p.run(x)
+        stats.append(next(s.executable.last_stats for s in p.segments if s.device == "npu-sim"))
+    fp16, w8 = stats
+    assert w8.int8_macs > 0 and w8.cycles < 0.8 * fp16.cycles and w8.dram_bytes < fp16.dram_bytes

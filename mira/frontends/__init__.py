@@ -1,1 +1,1 @@
-"""Front ends that produce Mira IR from something other than Mira source (e.g. ONNX models)."""
+"""Front ends that produce MIRA IR from something other than MIRA source (e.g. ONNX models)."""

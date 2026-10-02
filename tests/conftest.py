@@ -1,8 +1,13 @@
 """Which optional targets this machine can run."""
 import importlib.util
+import os
 import platform
 import shutil
 import subprocess
+import tempfile
+
+# compiled-model cache for this test session only (don't fill the user's ~/.cache/mira)
+os.environ.setdefault("MIRA_CACHE_DIR", tempfile.mkdtemp(prefix="mira-test-cache-"))
 
 HAS_COREML = importlib.util.find_spec("coremltools") is not None and platform.system() == "Darwin"
 HAS_IREE = importlib.util.find_spec("iree") is not None and importlib.util.find_spec("iree.compiler") is not None

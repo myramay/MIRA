@@ -10,16 +10,22 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import hashlib
+import json
 import logging
 import os
+import platform
+import shutil
 import sys
 import tempfile
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
 from .. import ir
+from ..ops import conv_params
 
 _UNARY = {"relu": "relu", "sigmoid": "sigmoid", "tanh": "tanh", "exp": "exp", "log": "log", "sqrt": "sqrt",
           "abs": "abs", "sign": "sign", "erf": "erf"}
@@ -35,7 +41,7 @@ _REDUCE = {"reduce_sum": "reduce_sum", "reduce_mean": "reduce_mean", "reduce_max
 SUPPORTED = set(_UNARY) | set(_BINARY) | set(_REDUCE) | set(_COMPARE) | {
     "neg", "gelu", "matmul", "conv2d", "maxpool2d", "softmax", "transpose", "reshape", "concat", "layernorm", "cast",
     "where", "broadcast", "slice", "pad", "dequantize", "gather", "argmax", "argmin", "scatter_add",
-    "dynamic_slice", "dynamic_update_slice"}
+    "dynamic_slice", "dynamic_update_slice", "qmatmul", "qconv2d"}
 
 COMPUTE_UNITS = {"ne": "CPU_AND_NE", "all": "ALL", "gpu": "CPU_AND_GPU", "cpu": "CPU_ONLY"}
 
@@ -80,54 +86,108 @@ def _quiet():
     os.environ.setdefault("TQDM_DISABLE", "1")
 
 
+def default_cache_dir() -> Path:
+    return Path(os.environ.get("MIRA_CACHE_DIR", Path.home() / ".cache" / "mira")) / "coreml"
+
+
+def fingerprint(g: ir.Graph, units: str) -> str:
+    """A key for the compiled model: the exact graph (weights included), settings, and tool versions."""
+    import coremltools as ct
+    h = hashlib.sha256(f"mira-coreml-1|{ct.__version__}|{platform.mac_ver()[0]}|{units}".encode())
+    pos = {v: f"in{i}" for i, v in enumerate(g.inputs)}
+    for i, op in enumerate(g.ops):
+        pos[op.result] = f"op{i}"
+    h.update(";".join(str(v.type) for v in g.inputs).encode())
+    for op in g.ops:
+        h.update(f"|{op.kind}|{[pos[v] for v in op.inputs]}|{op.result.type}".encode())
+        for k in sorted(op.attrs):
+            val = op.attrs[k]
+            if isinstance(val, np.ndarray):
+                h.update(f"{k}:{val.dtype}:{val.shape}".encode())
+                h.update(np.ascontiguousarray(val).tobytes())
+            else:
+                h.update(f"{k}={val!r}".encode())
+    h.update(str([pos[v] for v in g.outputs]).encode())
+    return h.hexdigest()[:32]
+
+
 class CoreMLExecutable:
-    def __init__(self, g: ir.Graph, units: str):
+    def __init__(self, g: ir.Graph, units: str, cache: bool = True):
         _quiet()
         import coremltools as ct
+
+        self.g = g
+        self.units = units
+        self.in_names = {v: f"in{i}" for i, v in enumerate(g.inputs)}
+        self.out_names = {v: f"out{i}" for i, v in enumerate(g.outputs)}
+        # MIL op names come from positions in the graph, so they're identical in every process (the cache relies
+        # on that for the placement report)
+        self.op_names = {op.result: self.out_names.get(op.result, f"op{i}") for i, op in enumerate(g.ops)}
+        self.native_log: list[str] = []
+        self.from_cache = False
+        compute_units = getattr(ct.ComputeUnit, COMPUTE_UNITS[units])
+        entry = default_cache_dir() / fingerprint(g, units) if cache and not os.environ.get("MIRA_NO_CACHE") else None
+        if entry is not None and (entry / "model.mlmodelc").is_dir() and (entry / "meta.json").is_file():
+            meta = json.loads((entry / "meta.json").read_text())
+            with capture_native_output(self.native_log):
+                self.model = ct.models.CompiledMLModel(str(entry / "model.mlmodelc"), compute_units=compute_units)
+            self.placement = meta["placement"]
+            self.native_log = meta["native_log"] + self.native_log
+            self.from_cache = True
+        else:
+            prog, precision = self._build_program(ct)
+            with capture_native_output(self.native_log):
+                self.model = ct.convert(prog, convert_to="mlprogram", compute_units=compute_units,
+                                        minimum_deployment_target=ct.target.macOS15, compute_precision=precision)
+                self.placement = self._compute_plan(ct)
+            if entry is not None:
+                self._store(entry)
+        self.warmed_up = False
+        self._recent_inputs: list[dict[str, np.ndarray]] = []
+
+    def _store(self, entry: Path) -> None:
+        """Save the compiled model; written to a temporary directory and renamed, so readers never see half."""
+        tmp = None
+        try:
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            tmp = Path(tempfile.mkdtemp(dir=entry.parent, prefix=".tmp-"))
+            shutil.copytree(self.model.get_compiled_model_path(), tmp / "model.mlmodelc")
+            (tmp / "meta.json").write_text(json.dumps({"placement": self.placement, "native_log": self.native_log}))
+            os.replace(tmp, entry)
+        except OSError:   # another process won the race, or the disk is read-only: just don't cache
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    def _build_program(self, ct):
         from coremltools.converters.mil import Builder as mb
         from coremltools.converters.mil.mil import Function, Program
         from coremltools.converters.mil.mil import types as mtypes
 
-        self.g = g
-        self.units = units
+        g = self.g
         mdt = {"f16": mtypes.fp16, "f32": mtypes.fp32, "i32": mtypes.int32}
-        specs, self.in_names = {}, {}
-        for i, v in enumerate(g.inputs):
-            name = f"in{i}"
-            self.in_names[v] = name
-            specs[name] = mb.TensorSpec(shape=v.type.shape or (1,), dtype=mdt[v.type.dtype])
-        self.out_names = {v: f"out{i}" for i, v in enumerate(g.outputs)}
-
+        specs = {self.in_names[v]: mb.TensorSpec(shape=v.type.shape or (1,), dtype=mdt[v.type.dtype])
+                 for v in g.inputs}
         with Function(specs, opset_version=ct.target.macOS15) as func:
             env: dict[ir.Value, object] = {}
             for v in g.inputs:   # Core ML inputs have rank >= 1; scalars come in as [1] and are squeezed
                 inp = func.inputs[self.in_names[v]]
                 env[v] = mb.squeeze(x=inp) if v.type.rank == 0 else inp
-            for op in g.ops:
+            for i, op in enumerate(g.ops):
                 if op.is_const:
                     env[op.result] = op.attrs["value"]
                     continue
-                name = self.out_names.get(op.result, f"op{op.result.id}")
+                name = self.op_names[op.result]
                 if op.result in self.out_names and op.result.type.rank == 0:
-                    tmp = self._lower(mb, op, env, f"op{op.result.id}")
+                    tmp = self._lower(mb, op, env, f"op{i}")
                     env[op.result] = mb.reshape(x=tmp, shape=[1], name=name)
                 else:
                     env[op.result] = self._lower(mb, op, env, name)
             func.set_outputs([env[v] for v in g.outputs])
         prog = Program()
         prog.add_function("main", func)
-
         floats = [op.result.type.dtype for op in g.compute_ops() if op.result.type.is_float]
         precision = ct.precision.FLOAT16 if all(d == "f16" for d in floats) else ct.precision.FLOAT32
-        self.native_log: list[str] = []
-        with capture_native_output(self.native_log):
-            self.model = ct.convert(prog, convert_to="mlprogram",
-                                    compute_units=getattr(ct.ComputeUnit, COMPUTE_UNITS[units]),
-                                    minimum_deployment_target=ct.target.macOS15,
-                                    compute_precision=precision)
-            self.placement = self._compute_plan(ct)
-        self.warmed_up = False
-        self._recent_inputs: list[dict[str, np.ndarray]] = []
+        return prog, precision
 
     # ----- IR op -> MIL ops
 
@@ -144,7 +204,7 @@ class CoreMLExecutable:
         if k in _BINARY:
             return getattr(mb, _BINARY[k])(x=x[0], y=x[1], name=name)
         mil_dt = MIL_DTYPE[op.result.type.dtype]
-        if k in _COMPARE:     # MIL comparisons return bool; Mira's are 1.0 / 0.0
+        if k in _COMPARE:     # MIL comparisons return bool; MIRA's are 1.0 / 0.0
             return mb.cast(x=getattr(mb, _COMPARE[k])(x=x[0], y=x[1]), dtype=mil_dt, name=name)
         if k == "where":
             cond = mb.not_equal(x=x[0], y=op.inputs[0].type.np_dtype(0))
@@ -162,7 +222,7 @@ class CoreMLExecutable:
             return mb.slice_by_size(x=x[0], begin=list(a["begin"]), size=list(a["size"]), name=name)
         if k == "pad":
             flat = [n for pair in a["pads"] for n in pair]
-            return mb.pad(x=x[0], pad=flat, mode="constant", constant_val=np_dt(0), name=name)
+            return mb.pad(x=x[0], pad=flat, mode="constant", constant_val=np_dt(a.get("value", 0)), name=name)
         if k == "dequantize":   # weights stored as int8, expanded on load (Core ML keeps them compressed)
             return mb.constexpr_affine_dequantize(quantized_data=a["q"], scale=a["scale"].astype(np_dt),
                                                   zero_point=np.int8(0), axis=a["axis"], name=name)
@@ -203,9 +263,12 @@ class CoreMLExecutable:
         if k == "maxpool2d":
             s = a["size"]
             return mb.max_pool(x=x[0], kernel_sizes=[s, s], strides=[a["stride"]] * 2, pad_type="valid", name=name)
-        if k in ("matmul", "conv2d"):
+        if k in ("matmul", "conv2d", "qmatmul", "qconv2d"):
             epi = a.get("epilogue", ())
             core_name = name if not epi else f"{name}_core"
+            if k in ("qmatmul", "qconv2d"):
+                acc = self._lower_int8(mb, op, x[0], np_dt, core_name)
+                return self._epilogue(mb, epi, acc, x, name)
             wp = op.inputs[1].producer
             w_const = wp is not None and wp.is_const
             if k == "matmul" and wp is not None and wp.kind == "dequantize" and op.inputs[0].type.rank <= 3:
@@ -223,20 +286,45 @@ class CoreMLExecutable:
             elif k == "matmul":
                 acc = mb.matmul(x=x[0], y=x[1], name=core_name)
             else:
-                (sh, sw), (ph, pw) = a["stride"], a["padding"]
+                (sh, sw), (ph, pw), (dh, dw), groups = conv_params(a)
                 acc = mb.conv(x=x[0], weight=x[1], strides=[sh, sw], pad_type="custom", pad=[ph, ph, pw, pw],
+                              dilations=[dh, dw], groups=groups,
                               name=core_name)
-            # Emit the epilogue as ordinary MIL ops; Core ML's own compiler re-fuses them.
-            for i, (fn, idx, swapped) in enumerate(epi):
-                step_name = name if i == len(epi) - 1 else f"{name}_e{i}"
-                if idx is None:
-                    acc = (mb.gelu(x=acc, mode="TANH_APPROXIMATION", name=step_name) if fn == "gelu"
-                           else getattr(mb, _UNARY[fn])(x=acc, name=step_name))
-                else:
-                    lhs, rhs = (x[idx], acc) if swapped else (acc, x[idx])
-                    acc = getattr(mb, _BINARY[fn])(x=lhs, y=rhs, name=step_name)
-            return acc
+            return self._epilogue(mb, epi, acc, x, name)
         raise NotImplementedError(k)
+
+    def _epilogue(self, mb, epi, acc, x, name):
+        """The fused epilogue as ordinary MIL ops; Core ML's own compiler re-fuses them."""
+        for i, (fn, idx, swapped) in enumerate(epi):
+            step_name = name if i == len(epi) - 1 else f"{name}_e{i}"
+            if idx is None:
+                acc = (mb.gelu(x=acc, mode="TANH_APPROXIMATION", name=step_name) if fn == "gelu"
+                       else getattr(mb, _UNARY[fn])(x=acc, name=step_name))
+            else:
+                lhs, rhs = (x[idx], acc) if swapped else (acc, x[idx])
+                acc = getattr(mb, _BINARY[fn])(x=lhs, y=rhs, name=step_name)
+        return acc
+
+    def _lower_int8(self, mb, op: ir.Op, x, np_dt, name: str):
+        """W8A8 in Core ML's vocabulary: quantize -> dequantize the activation (with the calibrated scale) and
+        an int8 constexpr weight. Core ML's compiler fuses that pattern into int8 compute on chips whose Neural
+        Engine supports it, and runs it in fp16 otherwise; the numbers are the same either way."""
+        a = op.attrs
+        xs = np_dt(a["x_scale"])
+        xq = mb.quantize(input=x, scale=xs, zero_point=np.int8(0), output_dtype="int8")
+        xd = mb.dequantize(input=xq, scale=xs, zero_point=np.int8(0))
+        ws = a["w_scale"].astype(np_dt)
+        if op.kind == "qmatmul":
+            if op.inputs[0].type.rank <= 3:          # linear wants the weight as [N, K]
+                w = mb.constexpr_affine_dequantize(quantized_data=np.ascontiguousarray(a["q"].T), scale=ws,
+                                                   zero_point=np.int8(0), axis=0)
+                return mb.linear(x=xd, weight=w, name=name)
+            w = mb.constexpr_affine_dequantize(quantized_data=a["q"], scale=ws, zero_point=np.int8(0), axis=1)
+            return mb.matmul(x=xd, y=w, name=name)
+        (sh, sw), (ph, pw), (dh, dw), groups = conv_params(a)
+        w = mb.constexpr_affine_dequantize(quantized_data=a["q"], scale=ws, zero_point=np.int8(0), axis=0)
+        return mb.conv(x=xd, weight=w, strides=[sh, sw], pad_type="custom", pad=[ph, ph, pw, pw],
+                       dilations=[dh, dw], groups=groups, name=name)
 
     # ----- where did Core ML put each op?
 
@@ -260,8 +348,7 @@ class CoreMLExecutable:
             return {"<error>": str(e)}
 
     def device_of(self, v: ir.Value) -> Optional[str]:
-        name = self.out_names.get(v, f"op{v.id}")
-        return self.placement.get(name)
+        return self.placement.get(self.op_names.get(v, ""))
 
     def run(self, feeds: dict[ir.Value, np.ndarray]) -> dict[ir.Value, np.ndarray]:
         inputs = {self.in_names[v]: np.ascontiguousarray(arr.reshape(v.type.shape or (1,)), dtype=v.type.np_dtype)
@@ -287,6 +374,8 @@ class CoreMLExecutable:
         counts = {d: devs.count(d) for d in sorted(set(devs), key=str)}
         summary = ", ".join(f"{d or 'fused/renamed'}: {n}" for d, n in counts.items())
         text = f"coreml ({COMPUTE_UNITS[self.units]}): {len(devs)} ops -> {summary}"
+        if self.from_cache:
+            text += " (compiled model loaded from cache)"
         if self.ane_rejected:
             text += ("\nwarning: Apple's ANE compiler rejected part of this model; Core ML runs that part on "
                      "the CPU/GPU instead (results are still correct)")
@@ -300,8 +389,9 @@ class CoreMLExecutable:
 class CoreMLTarget:
     name = "coreml"
 
-    def __init__(self, units: str = "ne"):
+    def __init__(self, units: str = "ne", cache: bool = True):
         self.units = units
+        self.cache = cache
 
     def check(self, op: ir.Op) -> Optional[str]:
         if op.kind not in SUPPORTED:
@@ -321,4 +411,4 @@ class CoreMLTarget:
         return None
 
     def compile(self, g: ir.Graph) -> CoreMLExecutable:
-        return CoreMLExecutable(g, self.units)
+        return CoreMLExecutable(g, self.units, self.cache)

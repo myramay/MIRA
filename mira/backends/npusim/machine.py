@@ -171,12 +171,14 @@ class MatMul(Instr):
     a: Tile
     b: Tile
     accumulate: bool
+    int8: bool = False          # int8 x int8 -> int32 mode: twice the MACs per cycle
 
     def __post_init__(self):
         self.engine = "mxu"
 
     def __str__(self):
-        return f"mxu.matmul  {self.acc} {'+=' if self.accumulate else '='} {self.a} @ {self.b}"
+        op = "mxu.matmul8" if self.int8 else "mxu.matmul "
+        return f"{op} {self.acc} {'+=' if self.accumulate else '='} {self.a} @ {self.b}"
 
 
 @dataclass
@@ -224,6 +226,7 @@ class Stats:
     instrs: dict[str, int] = field(default_factory=lambda: {"dma": 0, "mxu": 0, "vpu": 0})
     dram_bytes: int = 0
     macs: int = 0
+    int8_macs: int = 0          # the part of `macs` done in int8 mode (counts half against fp16 peak)
 
     def summary(self, cfg: Config) -> str:
         us = self.cycles / (cfg.clock_ghz * 1e3)
@@ -233,8 +236,10 @@ class Stats:
             util = 100 * self.busy[e] / self.cycles if self.cycles else 0
             lines.append(f"  {e}: {self.instrs[e]:6,} instrs, busy {self.busy[e]:>10,} cycles ({util:5.1f}%)")
         if self.cycles:
+            used = (self.macs - self.int8_macs / 2) / self.cycles / peak
             lines.append(f"  MACs {self.macs:,}  -> {self.macs / self.cycles:,.0f} MAC/cycle "
-                         f"({100 * self.macs / self.cycles / peak:.1f}% of {peak} peak)")
+                         f"({100 * used:.1f}% of the matrix unit" + (", int8 counts double" if self.int8_macs else "")
+                         + ")")
         lines.append(f"  DRAM traffic {self.dram_bytes / 1024:,.1f} KiB")
         return "\n".join(lines)
 
@@ -336,7 +341,9 @@ class Machine:
             self.stats.macs += m * k * n
             d = cfg.mxu_dim
             # weight-stationary systolic array: load a d x d block of B, stream m rows of A through it
-            cycles = math.ceil(k / d) * math.ceil(n / d) * (m + d) + 16
+            cycles = math.ceil(k / d) * math.ceil(n / d) * (m + d) // (2 if ins.int8 else 1) + 16
+            if ins.int8:
+                self.stats.int8_macs += m * k * n
             reads = self.banks(ins.a) | self.banks(ins.b) | (self.banks(ins.acc) if ins.accumulate else set())
             return cycles, reads, self.banks(ins.acc)
         if isinstance(ins, Vec):
@@ -347,6 +354,10 @@ class Machine:
                     out = args[0]
                 elif ins.fn == "where":
                     out = np.where(args[0] != 0, args[1], args[2])
+                elif ins.fn == "fma":                 # fused multiply-add: a + b * c
+                    out = args[0] + args[1] * args[2]
+                elif ins.fn == "quant":               # int8 quantization: clip(round(a / scale), -127, 127)
+                    out = np.clip(np.round(args[0] / args[1]), -127, 127)
                 elif ins.fn in UNARY:
                     out = UNARY[ins.fn](args[0])
                 else:

@@ -1,9 +1,9 @@
-"""MLIR backend: Mira IR -> MLIR (upstream dialects) -> IREE -> native code.
+"""MLIR backend: MIRA IR -> MLIR (upstream dialects) -> IREE -> native code.
 
 This is how production ML compilers are built: instead of hand-writing every
 backend, lower to MLIR's standard dialects and reuse the ecosystem.
 
-    Mira op                      MLIR
+    MIRA op                      MLIR
     elementwise / where / cast   linalg.generic + arith / math (broadcasting via indexing maps)
     matmul                       linalg.matmul / linalg.batch_matmul (fp32 accumulation)
     conv2d, maxpool2d            tensor.pad + linalg.conv_2d_nchw_fchw / linalg.pooling_nchw_max
@@ -26,14 +26,17 @@ from typing import Optional
 import numpy as np
 
 from .. import ir
+from ..ops import conv_params
 from ..types import TensorType
 
 GELU_C = 0.7978845608028654
 GELU_K = 0.044715
 
 UNSUPPORTED = {"sort", "cumprod", "conv2d_grad_input", "conv2d_grad_weight", "maxpool2d_grad", "scatter_add"}
+# (qconv2d with groups > 1 never occurs: the W8A8 pass keeps grouped convolutions in floating point)
 I32_MAX, I32_MIN = 2**31 - 1, -2**31
 REDUCE_ALIGN = 32      # see Emitter.reduce
+CONV_LAYOUT = "nchw"   # see Emitter.conv: "nhwc" was slower with IREE 3.11 in our benchmarks
 F32_MATH = {"exp", "log", "sqrt", "tanh", "sigmoid", "gelu", "erf", "pow", "div"}   # computed in fp32 for fp16
 
 
@@ -488,7 +491,8 @@ class Emitter:
                       f"{ttype(ins[0][1])} to {ttype(out)}")
             return r
         if k == "pad":
-            return self.pad(ins[0][0], ins[0][1], out, [lo for lo, _ in a["pads"]], [hi for _, hi in a["pads"]], 0.0)
+            return self.pad(ins[0][0], ins[0][1], out, [lo for lo, _ in a["pads"]], [hi for _, hi in a["pads"]],
+                            a.get("value", 0.0))
         if k == "concat" and out.rank == 1 and all(t.numel == 1 for _, t in ins):
             # Small vectors of scalars (e.g. a runtime start position [t, 0]) are built with
             # tensor.from_elements: IREE 3.11 miscompiles tensor.concat -> extract -> extract_slice.
@@ -550,6 +554,8 @@ class Emitter:
                 f"%n = arith.mulf {args[0]}, %s : f32", f"%m = arith.mulf %n, {args[2]} : f32",
                 f"%r = arith.addf %m, {args[3]} : f32"], "%r"))
             return self.narrow(y, xt, dt)
+        if k in ("qmatmul", "qconv2d"):
+            return self.epilogue(op, self.int8_op(op, ins[0], out), out, ins)
         if k == "matmul":
             return self.epilogue(op, self.matmul(ins[0], ins[1], out), out, ins)
         if k == "conv2d":
@@ -694,7 +700,7 @@ class Emitter:
 
     def conv(self, x: tuple[str, TensorType], w: tuple[str, TensorType], out: TensorType, a: dict) -> str:
         (xv, xt), (wv, wt) = x, w
-        (sh, sw), (ph, pw) = a["stride"], a["padding"]
+        (sh, sw), (ph, pw), (dh, dw), groups = conv_params(a)
         if xt.dtype != "f32":
             # Widen fp16 operands explicitly: IREE 3.11's CPU codegen fails on some mixed-precision
             # (f16 x f16 -> f32) convolutions ("slice ... runs out-of-bounds"). Constant weights fold.
@@ -708,13 +714,112 @@ class Emitter:
             xv = self.pad(xv, xt, pt, [0, 0, ph, pw], [0, 0, ph, pw], 0.0)
             xt = pt
         at = TensorType("f32", out.shape)
-        init = self.fill(at, 0.0)
-        r = self.fresh()
-        self.emit(f"{r} = linalg.conv_2d_nchw_fchw {{dilations = dense<1> : tensor<2xi64>, "
-                  f"strides = dense<[{sh}, {sw}]> : tensor<2xi64>}} ins({xv}, {wv} : {ttype(xt)}, {ttype(wt)}) "
-                  f"outs({init} : {ttype(at)}) -> {ttype(at)}")
+        attrs = (f"{{dilations = dense<[{dh}, {dw}]> : tensor<2xi64>, "
+                 f"strides = dense<[{sh}, {sw}]> : tensor<2xi64>}}")
+        if groups == 1 and CONV_LAYOUT == "nhwc":
+            # IREE's fast convolution paths are channels-last: transpose in and out (consecutive convs' transposes
+            # cancel, and the weight transpose folds into the constant at compile time).
+            n, c, h, wd = xt.shape
+            o, _, kh, kw = wt.shape
+            x_t = TensorType(xt.dtype, (n, h, wd, c))
+            w_t = TensorType(wt.dtype, (kh, kw, c, o))
+            a_t = TensorType("f32", (n,) + out.shape[2:] + (o,))
+            xv, wv = self.transpose(xv, xt, x_t, (0, 2, 3, 1)), self.transpose(wv, wt, w_t, (2, 3, 1, 0))
+            init = self.fill(a_t, 0.0)
+            r = self.fresh()
+            self.emit(f"{r} = linalg.conv_2d_nhwc_hwcf {attrs} ins({xv}, {wv} : {ttype(x_t)}, {ttype(w_t)}) "
+                      f"outs({init} : {ttype(a_t)}) -> {ttype(a_t)}")
+            r = self.transpose(r, a_t, at, (0, 3, 1, 2))
+        elif groups == 1:
+            init = self.fill(at, 0.0)
+            r = self.fresh()
+            self.emit(f"{r} = linalg.conv_2d_nchw_fchw {attrs} ins({xv}, {wv} : {ttype(xt)}, {ttype(wt)}) "
+                      f"outs({init} : {ttype(at)}) -> {ttype(at)}")
+        else:   # grouped / depthwise: split the channel axes into (group, channels-per-group)
+            n, c, h, wd = xt.shape
+            o, cg, kh, kw = wt.shape
+            xg = TensorType(xt.dtype, (n, groups, c // groups, h, wd))
+            wg = TensorType(wt.dtype, (groups, o // groups, cg, kh, kw))
+            ag = TensorType("f32", (n, groups, o // groups) + out.shape[2:])
+            xv, wv = self.reshape(xv, xt, xg), self.reshape(wv, wt, wg)
+            init = self.fill(ag, 0.0)
+            r = self.fresh()
+            self.emit(f"{r} = linalg.conv_2d_ngchw_gfchw {attrs} ins({xv}, {wv} : {ttype(xg)}, {ttype(wg)}) "
+                      f"outs({init} : {ttype(ag)}) -> {ttype(ag)}")
+            r = self.reshape(r, ag, at)
         if out.dtype != "f32":
             r = self.generic(out, [(r, at)], lambda args: ([f"%r = arith.truncf {args[0]} : f32 to {out.dtype}"], "%r"))
+        return r
+
+    def int8_op(self, op: ir.Op, x: tuple[str, TensorType], out: TensorType) -> str:
+        """W8A8: quantize x to i8 with the calibrated scale, multiply i8 x i8 with i32 sums, rescale to float."""
+        a = op.attrs
+        xv, xt = x
+        xs = float(a["x_scale"])
+        qt = TensorType("i8", xt.shape)
+        dt = xt.dtype
+        xq = self.generic(qt, [(xv, xt)], lambda args: ([
+            f"%w = arith.extf {args[0]} : {dt} to f32" if dt != "f32" else f"%w = arith.addf {args[0]}, %zero : f32",
+            f"%s = arith.constant {scalar_lit(xs, 'f32')} : f32", "%d = arith.divf %w, %s : f32",
+            "%r = math.roundeven %d : f32", f"%hi = arith.constant {scalar_lit(127.0, 'f32')} : f32",
+            f"%lo = arith.constant {scalar_lit(-127.0, 'f32')} : f32", "%c1 = arith.minimumf %r, %hi : f32",
+            "%c2 = arith.maximumf %c1, %lo : f32", "%q = arith.fptosi %c2 : f32 to i8"], "%q")
+                          if dt != "f32" else ([
+            f"%s = arith.constant {scalar_lit(xs, 'f32')} : f32", f"%d = arith.divf {args[0]}, %s : f32",
+            "%r = math.roundeven %d : f32", f"%hi = arith.constant {scalar_lit(127.0, 'f32')} : f32",
+            f"%lo = arith.constant {scalar_lit(-127.0, 'f32')} : f32", "%c1 = arith.minimumf %r, %hi : f32",
+            "%c2 = arith.maximumf %c1, %lo : f32", "%q = arith.fptosi %c2 : f32 to i8"], "%q"))
+        q = a["q"]
+        wt = TensorType("i8", tuple(q.shape))
+        wv = self.fresh()
+        self.emit(f"{wv} = arith.constant {self.const_attr(q)} : {ttype(wt)}")
+        if op.kind == "qmatmul":
+            m = int(np.prod(xt.shape[:-1]))
+            q2 = TensorType("i8", (m, xt.shape[-1]))
+            acc_t = TensorType("i32", (m, q.shape[1]))
+            init = self.fill(acc_t, 0)
+            r = self.fresh()
+            self.emit(f"{r} = linalg.matmul ins({self.reshape(xq, qt, q2)}, {wv} : {ttype(q2)}, {ttype(wt)}) "
+                      f"outs({init} : {ttype(acc_t)}) -> {ttype(acc_t)}")
+            scale_shape = (1, q.shape[1])
+        else:
+            (sh, sw), (ph, pw), (dh, dw), groups = conv_params(a)
+            # IREE 3.11's CPU codegen fails ("slice ... runs out-of-bounds") on integer convolutions, and on any
+            # convolution whose input is an elementwise op applied *after* tensor.pad. So: convert the int8
+            # values to f32 first (f32 holds these integer products and sums exactly, up to 2^24), then pad,
+            # then convolve. The result is the same as an i8 x i8 -> i32 convolution.
+            ext = lambda args: (["%e = arith.sitofp " + args[0] + " : i8 to f32"], "%e")   # noqa: E731
+            qf, wf = qt.with_dtype("f32"), wt.with_dtype("f32")
+            xq, wv, qt, wt = self.generic(qf, [(xq, qt)], ext), self.generic(wf, [(wv, wt)], ext), qf, wf
+            if ph or pw:
+                n, c, h, wd = xt.shape
+                pt = TensorType("f32", (n, c, h + 2 * ph, wd + 2 * pw))
+                xq, qt = self.pad(xq, qt, pt, [0, 0, ph, pw], [0, 0, ph, pw], 0.0), pt
+            acc_t = TensorType("f32", out.shape)
+            init = self.fill(acc_t, 0.0)
+            r = self.fresh()
+            self.emit(f"{r} = linalg.conv_2d_nchw_fchw {{dilations = dense<[{dh}, {dw}]> : tensor<2xi64>, "
+                      f"strides = dense<[{sh}, {sw}]> : tensor<2xi64>}} ins({xq}, {wv} : {ttype(qt)}, {ttype(wt)}) "
+                      f"outs({init} : {ttype(acc_t)}) -> {ttype(acc_t)}")
+            scale_shape = (1, q.shape[0], 1, 1)
+        combined = (np.float64(xs) * a["w_scale"].astype(np.float64)).astype(np.float32).reshape(scale_shape)
+        st = TensorType("f32", scale_shape)
+        sv = self.fresh()
+        self.emit(f"{sv} = arith.constant {self.const_attr(combined)} : {ttype(st)}")
+        y_t = TensorType(out.dtype, acc_t.shape)
+        conv = "" if out.dtype == "f32" else f"%y = arith.truncf %m : f32 to {out.dtype}"
+        to_f = ("%f = arith.sitofp {} : i32 to f32" if acc_t.dtype == "i32" else "%f = arith.addf {}, %fz : f32")
+        y = self.generic(y_t, [(r, acc_t), (sv, st)], lambda args: (
+            ([] if acc_t.dtype == "i32" else ["%fz = arith.constant 0.0 : f32"]) + [to_f.format(args[0]),
+             f"%m = arith.mulf %f, {args[1]} : f32"] + ([conv] if conv else []),
+            "%y" if conv else "%m"))
+        return self.reshape(y, y_t, out)
+
+    def transpose(self, v: str, t: TensorType, out: TensorType, perm: tuple[int, ...]) -> str:
+        init = self.empty(out)
+        r = self.fresh()
+        self.emit(f"{r} = linalg.transpose ins({v} : {ttype(t)}) outs({init} : {ttype(out)}) "
+                  f"permutation = [{', '.join(map(str, perm))}]")
         return r
 
     def epilogue(self, op: ir.Op, acc: str, out: TensorType, ins) -> str:

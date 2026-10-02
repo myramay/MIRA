@@ -1,4 +1,4 @@
-"""ONNX importer: run existing models (exported from PyTorch, TensorFlow, ...) through Mira.
+"""ONNX importer: run existing models (exported from PyTorch, TensorFlow, ...) through MIRA.
 
 ONNX is a graph of named tensors and nodes. We walk the nodes in order and keep,
 for every tensor name, either
@@ -10,11 +10,12 @@ for every tensor name, either
 Nodes whose inputs are all known are evaluated right here with NumPy. That folds
 away the shape arithmetic exporters emit (Shape -> Gather -> Concat -> Reshape),
 so the graph that reaches the backends has static shapes, which NPUs need.
-Every other node is translated into Mira ops, after which the normal pipeline
+Every other node is translated into MIRA ops, after which the normal pipeline
 (optimizer, partitioner, backends) takes over.
 """
 from __future__ import annotations
 
+from collections import ChainMap
 from typing import Optional, Union
 
 import numpy as np
@@ -26,7 +27,7 @@ from ..types import TensorType
 
 Val = Union[np.ndarray, ir.Value]
 
-# ONNX TensorProto element types -> Mira dtypes (64-bit ints and bools become i32)
+# ONNX TensorProto element types -> MIRA dtypes (64-bit ints and bools become i32)
 ONNX_DTYPES = {1: "f32", 10: "f16", 11: "f32", 6: "i32", 7: "i32", 9: "i32", 2: "i32", 3: "i32", 4: "i32", 5: "i32",
                12: "i32", 13: "i32"}
 NP_OF = {1: np.float32, 10: np.float16, 11: np.float64, 6: np.int32, 7: np.int64, 9: np.bool_, 2: np.uint8,
@@ -155,6 +156,20 @@ class Importer:
             if name:
                 self.env[name] = v
 
+    def subgraph(self, g, bindings: dict) -> list:
+        """Import a nested graph (an If branch or Loop body). Its nodes see the enclosing names, but the names
+        they define stay local to this import."""
+        saved = self.env
+        self.env = ChainMap(dict(bindings), saved)
+        try:
+            for init in g.initializer:
+                self.env[init.name] = self.numpy_helper.to_array(init)
+            for node in g.node:
+                self.node(node)
+            return [self.env[o.name] for o in g.output]
+        finally:
+            self.env = saved
+
     def constant(self, a: dict) -> np.ndarray:
         if "value" in a:
             return self.numpy_helper.to_array(a["value"])
@@ -247,7 +262,7 @@ NUMPY = {
 }
 
 
-# ==================================================================== runtime ops -> Mira IR
+# ==================================================================== runtime ops -> MIRA IR
 
 def _unary(kind):
     return lambda imp, ins, a: imp.op(kind, [imp.T(ins[0])])
@@ -310,71 +325,99 @@ def _gemm(imp, ins, a):
     return y
 
 
-def _conv_pads(imp, x: ir.Value, a: dict, kernel) -> tuple[ir.Value, tuple[int, int]]:
-    """Resolve ONNX padding (incl. auto_pad and asymmetric pads) to symmetric (ph, pw), padding x if needed."""
+def _pads_2d(a: dict, hw, kernel, dilation=(1, 1)) -> tuple[int, int, int, int]:
+    """(top, left, bottom, right) from ONNX auto_pad / pads, for kernels with optional dilation."""
     strides = a.get("strides", [1, 1])
     auto = a.get("auto_pad", b"NOTSET")
     auto = auto.decode() if isinstance(auto, bytes) else auto
-    h, w = x.type.shape[2:]
     if auto in ("SAME_UPPER", "SAME_LOWER"):
         pads = []
-        for size, k, s in zip((h, w), kernel, strides):
-            total = max((int(np.ceil(size / s)) - 1) * s + k - size, 0)
+        for size, k, s, d in zip(hw, kernel, strides, dilation):
+            eff = d * (k - 1) + 1
+            total = max((int(np.ceil(size / s)) - 1) * s + eff - size, 0)
             lo = total // 2 if auto == "SAME_UPPER" else total - total // 2
             pads.append((lo, total - lo))
-        top, left, bottom, right = pads[0][0], pads[1][0], pads[0][1], pads[1][1]
-    elif auto == "VALID":
-        top = left = bottom = right = 0
-    else:
-        top, left, bottom, right = (list(a.get("pads", [0, 0, 0, 0])) + [0, 0, 0, 0])[:4]
-    if top == bottom and left == right:
-        return x, (top, left)
-    x = imp.op("pad", [x], pads=((0, 0), (0, 0), (top, bottom), (left, right)))
-    return x, (0, 0)
+        return pads[0][0], pads[1][0], pads[0][1], pads[1][1]
+    if auto == "VALID":
+        return 0, 0, 0, 0
+    top, left, bottom, right = (list(a.get("pads", [0, 0, 0, 0])) + [0, 0, 0, 0])[:4]
+    return top, left, bottom, right
 
 
 def _conv(imp, ins, a):
     x = imp.T(ins[0])
     w = imp.T(ins[1], x)
-    if a.get("group", 1) != 1:
-        raise ImportError_("grouped / depthwise Conv (group > 1) isn't supported yet")
-    if any(d != 1 for d in a.get("dilations", [1, 1])):
-        raise ImportError_("dilated Conv isn't supported yet")
     if x.type.rank != 4:
         raise ImportError_("only 2-D convolutions (NCHW) are supported")
-    x, pads = _conv_pads(imp, x, a, w.type.shape[2:])
+    dil = tuple(a.get("dilations", [1, 1]))
+    top, left, bottom, right = _pads_2d(a, x.type.shape[2:], w.type.shape[2:], dil)
+    if top != bottom or left != right:       # asymmetric: pad explicitly, then convolve unpadded
+        x = imp.op("pad", [x], pads=((0, 0), (0, 0), (top, bottom), (left, right)))
+        top = left = 0
     s = a.get("strides", [1, 1])
-    y = imp.op("conv2d", [x, w], stride=(s[0], s[1]), padding=pads)
+    attrs = {"stride": (s[0], s[1]), "padding": (top, left)}
+    if dil != (1, 1):
+        attrs["dilation"] = dil
+    if a.get("group", 1) != 1:
+        attrs["groups"] = int(a["group"])
+    y = imp.op("conv2d", [x, w], **attrs)
     if len(ins) > 2 and ins[2]:
         b = imp.T(ins[2], y)
         y = imp.op("add", [y, imp.reshape(b, (b.type.numel, 1, 1))])
     return y
 
 
+def _pool_window(imp, x: ir.Value, a: dict, fill: float):
+    """Pad x for a pooling window (explicit pads + extra for ceil_mode); return (x, k, s, explicit pads)."""
+    k = list(a["kernel_shape"])
+    s = list(a.get("strides", [1, 1]))
+    if any(d != 1 for d in a.get("dilations", [1, 1])):
+        raise ImportError_("pooling with dilation isn't supported")
+    h, w = x.type.shape[2:]
+    top, left, bottom, right = _pads_2d(a, (h, w), k)
+    extra = [0, 0]
+    if a.get("ceil_mode", 0):
+        for ax, (size, lo, hi) in enumerate(((h, top, bottom), (w, left, right))):
+            n_out = -(-(size + lo + hi - k[ax]) // s[ax]) + 1
+            if (n_out - 1) * s[ax] >= size + lo:          # last window would start inside the padding
+                n_out -= 1
+            extra[ax] = max(0, (n_out - 1) * s[ax] + k[ax] - (size + lo + hi))
+    pads = ((0, 0), (0, 0), (top, bottom + extra[0]), (left, right + extra[1]))
+    if any(lo or hi for lo, hi in pads):
+        x = imp.op("pad", [x], pads=pads, **({"value": fill} if fill else {}))
+    return x, k, s, (top, left, bottom, right), extra
+
+
 def _maxpool(imp, ins, a):
-    x = imp.T(ins[0])
-    k = a["kernel_shape"]
-    s = a.get("strides", [1, 1])
+    x, k, s, _, _ = _pool_window(imp, imp.T(ins[0]), a, -np.inf)
     if k[0] != k[1] or s[0] != s[1]:
         raise ImportError_("MaxPool: only square kernels and equal strides are supported")
-    if any(a.get("pads", [0, 0, 0, 0])) or a.get("ceil_mode", 0) or any(d != 1 for d in a.get("dilations", [1, 1])):
-        raise ImportError_("MaxPool: padding, ceil_mode and dilation aren't supported")
     return imp.op("maxpool2d", [x], size=k[0], stride=s[0])
 
 
 def _avgpool(imp, ins, a):
-    x = imp.T(ins[0])
-    k, s = a["kernel_shape"], a.get("strides", a["kernel_shape"])
-    n, c, h, w = x.type.shape
-    if list(k) != list(s) or h % k[0] or w % k[1] or any(a.get("pads", [0, 0, 0, 0])):
-        raise ImportError_("AveragePool: only non-overlapping windows (stride == kernel) without padding")
-    r = imp.reshape(x, (n, c, h // k[0], k[0], w // k[1], k[1]))
-    return imp.op("reduce_mean", [r], axes=(3, 5), keepdims=False)
+    """Average pooling = depthwise convolution with a constant kernel, divided by each window's element count."""
+    x0 = imp.T(ins[0])
+    x, k, s, (top, left, bottom, right), extra = _pool_window(imp, x0, a, 0.0)
+    n, c, h, w = x0.type.shape
+    ones = imp.g.const(np.ones((c, 1, k[0], k[1]), x0.type.np_dtype))
+    total = imp.op("conv2d", [x, ones], stride=(s[0], s[1]), padding=(0, 0), groups=c)
+    # count the elements each window averages: padding counts only if count_include_pad (never the ceil extra)
+    mask = np.zeros((h + top + bottom + extra[0], w + left + right + extra[1]), np.float64)
+    if a.get("count_include_pad", 0):
+        mask[:h + top + bottom, :w + left + right] = 1
+    else:
+        mask[top:top + h, left:left + w] = 1
+    win = np.lib.stride_tricks.sliding_window_view(mask, tuple(k))[::s[0], ::s[1]].sum(axis=(-2, -1))
+    count = imp.g.const(win.reshape(1, 1, *win.shape).astype(x0.type.np_dtype))
+    return imp.op("div", [total, count])
 
 
-def _global_avgpool(imp, ins, a):
-    x = imp.T(ins[0])
-    return imp.op("reduce_mean", [x], axes=tuple(range(2, x.type.rank)), keepdims=True)
+def _global_pool(kind):
+    def h(imp, ins, a):
+        x = imp.T(ins[0])
+        return imp.op(kind, [x], axes=tuple(range(2, x.type.rank)), keepdims=True)
+    return h
 
 
 def _batchnorm(imp, ins, a):
@@ -530,19 +573,23 @@ def _slice(imp, ins, a):
         axes = imp.K(ins[3]) if len(ins) > 3 and ins[3] else None
         steps = imp.K(ins[4]) if len(ins) > 4 and ins[4] else None
     axes = list(range(len(starts))) if axes is None else [int(ax) for ax in axes]
-    if steps is not None and any(int(s) != 1 for s in steps):
-        raise ImportError_("Slice with steps other than 1 isn't supported")
+    steps = [1] * len(starts) if steps is None else [int(st) for st in steps]
     begin, size = [0] * x.type.rank, list(x.type.shape)
-    for s, e, ax in zip(starts, ends, axes):
+    gathers = []
+    for st, en, ax, step in zip(starts, ends, axes, steps):
         ax %= x.type.rank
-        d = x.type.shape[ax]
-        s, e = int(s), int(e)
-        s = max(0, min(d, s + d if s < 0 else s))
-        e = max(0, min(d, e + d if e < 0 else e))
-        begin[ax], size[ax] = s, max(e - s, 0)
-    if tuple(size) == x.type.shape:
-        return x
-    return imp.op("slice", [x], begin=tuple(begin), size=tuple(size))
+        idx = list(range(x.type.shape[ax]))[slice(int(st), int(en), step)]   # Python slicing clamps like ONNX
+        if not idx:
+            raise ImportError_("Slice: empty slices aren't supported")
+        if idx == list(range(idx[0], idx[0] + len(idx))):
+            begin[ax], size[ax] = idx[0], len(idx)
+        else:
+            gathers.append((ax, idx))
+    if tuple(size) != x.type.shape:
+        x = imp.op("slice", [x], begin=tuple(begin), size=tuple(size))
+    for ax, idx in gathers:          # steps other than 1: pick the rows
+        x = imp.op("gather", [x, imp.g.const(np.array(idx, np.int32))], axis=ax)
+    return x
 
 
 def _gather(imp, ins, a):
@@ -615,12 +662,9 @@ def _arg(kind):
 def _pad(imp, ins, a):
     x = imp.T(ins[0])
     mode = a.get("mode", b"constant")
-    if (mode.decode() if isinstance(mode, bytes) else mode) != "constant":
-        raise ImportError_("Pad: only constant mode is supported")
+    mode = mode.decode() if isinstance(mode, bytes) else mode
     pads = a["pads"] if "pads" in a else [int(p) for p in imp.K(ins[1], "Pad pads")]
     value = a.get("value", 0.0) if imp.opset < 11 else (imp.K(ins[2]).item() if len(ins) > 2 and ins[2] else 0.0)
-    if value != 0:
-        raise ImportError_("Pad: only zero padding is supported")
     r = x.type.rank
     if len(ins) > 3 and ins[3]:
         axes = [int(ax) % r for ax in imp.K(ins[3])]
@@ -628,7 +672,78 @@ def _pad(imp, ins, a):
         for i, ax in enumerate(axes):
             full[ax], full[ax + r] = pads[i], pads[i + len(axes)]
         pads = full
-    return imp.op("pad", [x], pads=tuple((int(pads[i]), int(pads[i + r])) for i in range(r)))
+    pairs = tuple((int(pads[i]), int(pads[i + r])) for i in range(r))
+    if any(lo < 0 or hi < 0 for lo, hi in pairs):
+        raise ImportError_("Pad: negative pads (cropping) aren't supported")
+    if mode == "constant":
+        return imp.op("pad", [x], pads=pairs, **({"value": float(value)} if value else {}))
+    if mode not in ("edge", "reflect"):
+        raise ImportError_(f"Pad: mode '{mode}' isn't supported")
+    for ax, (lo, hi) in enumerate(pairs):      # edge / reflect: gather rows by a fixed index pattern
+        if lo or hi:
+            idx = np.pad(np.arange(x.type.shape[ax]), (lo, hi), mode="edge" if mode == "edge" else "reflect")
+            x = imp.op("gather", [x, imp.g.const(idx.astype(np.int32))], axis=ax)
+    return x
+
+
+def _if(imp, ins, a):
+    """Known condition: import only the chosen branch. Runtime condition: import both and select per output
+    (branches are side-effect free in ONNX, so computing both is correct; it's how predication works)."""
+    cond = imp.env[ins[0]]
+    if isinstance(cond, np.ndarray):
+        return imp.subgraph(a["then_branch"] if bool(cond.ravel()[0]) else a["else_branch"], {})
+    then_out = imp.subgraph(a["then_branch"], {})
+    else_out = imp.subgraph(a["else_branch"], {})
+    c = cond if isinstance(cond, ir.Value) else imp.T(ins[0])
+    outs = []
+    for t, e in zip(then_out, else_out):
+        anchor = t if isinstance(t, ir.Value) else e if isinstance(e, ir.Value) else None
+        tv = t if isinstance(t, ir.Value) else imp.g.const(_to_mira_array(t).astype(anchor.type.np_dtype))
+        ev = e if isinstance(e, ir.Value) else imp.g.const(_to_mira_array(e).astype(anchor.type.np_dtype))
+        if tv.type.shape != ev.type.shape:
+            raise ImportError_("If: branches with different output shapes need a static condition")
+        outs.append(imp.op("where", [c, tv, ev]))
+    return outs
+
+
+MAX_LOOP_UNROLL = 10_000
+
+
+def _loop(imp, ins, a):
+    """Loops with a trip count known at import time are unrolled (each iteration's body is imported once)."""
+    body = a["body"]
+    trip = imp.env.get(ins[0]) if ins and ins[0] else None
+    cond = imp.env.get(ins[1]) if len(ins) > 1 and ins[1] else np.array(True)
+    if not isinstance(trip, np.ndarray) or not isinstance(cond, np.ndarray):
+        raise ImportError_("Loop: only loops whose trip count and condition are known at import time are supported")
+    state = [imp.env[n] for n in ins[2:]]
+    names = [i.name for i in body.input]
+    scans: list[list] = []
+    n_iter = int(trip)
+    if n_iter > MAX_LOOP_UNROLL:
+        raise ImportError_(f"Loop: {n_iter} iterations is too many to unroll")
+    for i in range(n_iter):
+        if not bool(np.asarray(cond).ravel()[0]):
+            break
+        outs = imp.subgraph(body, dict(zip(names, [np.array(i, np.int64), np.asarray(cond)] + state)))
+        cond = outs[0]
+        if not isinstance(cond, np.ndarray):
+            raise ImportError_("Loop: the continue-condition must be known at import time")
+        state = outs[1:1 + len(state)]
+        for k, v in enumerate(outs[1 + len(state):]):
+            if len(scans) <= k:
+                scans.append([])
+            scans[k].append(v)
+    results = list(state)
+    for vals in scans:               # scan outputs: stack the per-iteration values along a new first axis
+        if all(isinstance(v, np.ndarray) for v in vals):
+            results.append(np.stack(vals))
+        else:
+            parts = [imp.reshape(v if isinstance(v, ir.Value) else imp.g.const(_to_mira_array(v)),
+                                 (1,) + tuple(np.shape(v) if isinstance(v, np.ndarray) else v.type.shape))
+                     for v in vals]
+            results.append(parts[0] if len(parts) == 1 else imp.op("concat", parts, axis=0))
+    return results
 
 
 def _reciprocal(imp, ins, a):
@@ -654,7 +769,8 @@ HANDLERS = {
     "And": _binary("mul"), "Or": _binary("maximum"), "Not": _not,
     "Max": _variadic("maximum"), "Min": _variadic("minimum"),
     "MatMul": _matmul, "Gemm": _gemm, "Conv": _conv, "MaxPool": _maxpool, "AveragePool": _avgpool,
-    "GlobalAveragePool": _global_avgpool, "BatchNormalization": _batchnorm, "LayerNormalization": _layernorm,
+    "GlobalAveragePool": _global_pool("reduce_mean"), "GlobalMaxPool": _global_pool("reduce_max"),
+    "If": _if, "Loop": _loop, "BatchNormalization": _batchnorm, "LayerNormalization": _layernorm,
     "Softmax": _softmax, "LogSoftmax": _log_softmax, "Gelu": _gelu, "Clip": _clip, "LeakyRelu": _leaky_relu,
     "HardSigmoid": lambda imp, ins, a: _hard_sigmoid(imp, imp.T(ins[0]), a.get("alpha", 0.2), a.get("beta", 0.5)),
     "HardSwish": lambda imp, ins, a: imp.op("mul", [imp.T(ins[0]), _hard_sigmoid(imp, imp.T(ins[0]), 1 / 6, 0.5)]),
@@ -669,7 +785,7 @@ HANDLERS = {
 
 
 def import_onnx(model, input_shapes: Optional[dict[str, tuple[int, ...]]] = None) -> ir.Graph:
-    """Translate an ONNX model (path, bytes, or ModelProto) into a Mira IR graph."""
+    """Translate an ONNX model (path, bytes, or ModelProto) into a MIRA IR graph."""
     return Importer(model, input_shapes).run()
 
 

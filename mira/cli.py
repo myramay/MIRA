@@ -54,6 +54,7 @@ def _compile(args, target: str) -> CompiledProgram:
                         double_buffer=not args.no_double_buffer, precision=args.precision,
                         cost_model=not args.no_cost_model, quantize=args.quantize, sim_fast=args.sim_fast,
                         sim_config=dict(kv.split("=", 1) for kv in args.sim or []), mlir_backend=args.mlir_backend,
+                        cache=not args.no_cache,
                         **extra)
     if isinstance(prog, ShapeSpecialized):
         from .frontends.onnx_import import onnx_inputs
@@ -118,7 +119,7 @@ def cmd_emit(args) -> int:
 
     if args.stage in ("tokens", "ast"):
         if args.file.endswith(".onnx"):
-            raise MiraError(f"'{args.stage}' is a Mira source stage; ONNX models start at the 'ir' stage")
+            raise MiraError(f"'{args.stage}' is a MIRA source stage; ONNX models start at the 'ir' stage")
         src = open(args.file).read()
         if args.stage == "tokens":
             for t in tokenize(src, args.file):
@@ -230,6 +231,20 @@ def cmd_bench(args) -> int:
     return 0
 
 
+def cmd_cache(args) -> int:
+    import shutil
+    from .backends.coreml import default_cache_dir
+    d = default_cache_dir()
+    entries = [e for e in d.iterdir() if e.is_dir() and not e.name.startswith(".")] if d.is_dir() else []
+    size = sum(f.stat().st_size for e in entries for f in e.rglob("*") if f.is_file())
+    if args.clear:
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"cleared {len(entries)} cached Core ML model(s), {size / 2**20:.1f} MiB, from {d}")
+    else:
+        print(f"{d}: {len(entries)} cached Core ML model(s), {size / 2**20:.1f} MiB  (mira cache --clear to remove)")
+    return 0
+
+
 def cmd_check(args) -> int:
     prog = _compile(args, "cpu")
     ins = ", ".join(f"{v.name}: {v.type}" for v in prog.graph.inputs)
@@ -238,7 +253,7 @@ def cmd_check(args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="mira", description="Mira tensor language compiler")
+    ap = argparse.ArgumentParser(prog="mira", description="MIRA tensor language compiler")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
@@ -257,8 +272,10 @@ def main(argv=None) -> int:
         p.add_argument("--no-fuse", action="store_true")
         p.add_argument("--no-double-buffer", action="store_true")
         p.add_argument("--no-cost-model", action="store_true", help="offload every supported op")
-        p.add_argument("--quantize", choices=["int8"], help="store large weights as int8 (per-channel scales)")
+        p.add_argument("--quantize", choices=["int8", "w8a8"],
+                       help="int8: store large weights as int8; w8a8: also do the multiplies in int8")
         p.add_argument("--sim-fast", action="store_true", help="npu-sim: timing only (outputs from the reference)")
+        p.add_argument("--no-cache", action="store_true", help="coreml: recompile instead of using cached models")
         p.add_argument("--mlir-backend", default="cpu", choices=["cpu", "metal"],
                        help="mlir target: compile with IREE for the CPU or the Mac GPU (Metal)")
         p.add_argument("--sim", action="append", metavar="KEY=VALUE",
@@ -286,16 +303,20 @@ def main(argv=None) -> int:
     p.add_argument("--iters", type=int, default=20)
     p.set_defaults(fn=cmd_bench)
 
+    p = sub.add_parser("cache", help="show or clear the compiled-model cache")
+    p.add_argument("--clear", action="store_true")
+    p.set_defaults(fn=cmd_cache)
+
     p = sub.add_parser("check", help="type-check only")
     common(p)
     p.set_defaults(fn=cmd_check)
 
     args = ap.parse_args(argv)
-    if args.target in ("sim", "ane"):
+    if getattr(args, "target", None) in ("sim", "ane"):
         args.target = {"sim": "npu-sim", "ane": "coreml"}[args.target]
-    if args.target == "iree":
+    if getattr(args, "target", None) == "iree":
         args.target = "mlir"
-    if args.precision == "none":
+    if getattr(args, "precision", None) == "none":
         args.precision = None
     try:
         return args.fn(args)

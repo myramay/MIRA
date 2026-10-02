@@ -1,4 +1,4 @@
-"""Fuzzing: generate random well-typed Mira programs and check that the
+"""Fuzzing: generate random well-typed MIRA programs and check that the
 optimizer and the NPU simulator agree with the unoptimized CPU reference.
 
 When a seed fails, `print(generate(seed))` gives you the program to debug.

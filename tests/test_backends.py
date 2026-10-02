@@ -153,3 +153,18 @@ def test_mlir_max_of_all_negative_rows(cols):
     m, am = mira.compile_source(src, "mlir", cost_model=False, precision=None).run({"x": x})
     np.testing.assert_allclose(m, x.max(1), rtol=1e-6)
     np.testing.assert_array_equal(am, x.argmax(1))
+
+
+@pytest.mark.skipif(not HAS_COREML, reason="needs macOS + coremltools")
+def test_coreml_compile_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_CACHE_DIR", str(tmp_path))
+    src = "fn main(x: f32[64, 256], const w: f32[256, 256]) -> f32[64, 256] {\n  return relu(x @ w)\n}\n"
+    x = np.random.default_rng(0).standard_normal((64, 256)).astype(np.float32)
+    first = mira.compile_source(src, "coreml")
+    second = mira.compile_source(src, "coreml")
+    other = mira.compile_source(src, "coreml", seed=5)       # different weights: must not hit the cache
+    ex1, ex2, ex3 = (p.segments[0].executable for p in (first, second, other))
+    assert not ex1.from_cache and ex2.from_cache and not ex3.from_cache
+    np.testing.assert_array_equal(first.run({"x": x}), second.run({"x": x}))
+    assert ex1.placement == ex2.placement
+    assert not mira.compile_source(src, "coreml", cache=False).segments[0].executable.from_cache

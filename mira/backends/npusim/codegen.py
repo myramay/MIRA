@@ -32,6 +32,7 @@ from typing import Optional
 import numpy as np
 
 from ... import ir
+from ...ops import conv_params
 from ...ops import BINARY, UNARY
 from .machine import (COL, FULL, ROW, SCALAR, Config, DramRegion, Instr, Load, MatMul, Program, RowOp, Store, Tile,
                       Vec)
@@ -109,6 +110,13 @@ def check(op: ir.Op, cfg: Config) -> Optional[str]:
         return "MNPU-1 only computes in fp16 (compile with precision f16)"
     k = op.kind
     out = op.result.type.shape
+    if k in ("qmatmul", "qconv2d"):
+        for fn, idx, _ in op.attrs.get("epilogue", ()):
+            mode = (bcast_mode if k == "qmatmul" else conv_channel_mode)(op.inputs[idx].type.shape, out) \
+                if idx is not None else FULL
+            if mode is None:
+                return f"{k} epilogue '{fn}': operand broadcast pattern not supported"
+        return None
     if k == "matmul":
         x, w = op.inputs[0].type.shape, op.inputs[1].type.shape
         if len(w) != 2 and x[:-2] != w[:-2]:
@@ -118,14 +126,22 @@ def check(op: ir.Op, cfg: Config) -> Optional[str]:
                 return f"matmul epilogue '{fn}': operand broadcast pattern not supported"
         return None
     if k == "conv2d":
-        c = op.inputs[0].type.shape[1]
-        if c > 512:
-            return "conv2d: more than 512 input channels per tap not implemented"
+        o, cg = op.inputs[1].type.shape[:2]
+        if cg > 512:
+            return "conv2d: more than 512 input channels per group not implemented"
+        wp = op.inputs[1].producer
+        if wp is None or not wp.is_constant_like:
+            return "conv2d: MNPU-1 needs constant weights"
         for fn, idx, _ in op.attrs.get("epilogue", ()):
             if idx is not None and conv_channel_mode(op.inputs[idx].type.shape, out) is None:
                 return f"conv2d epilogue '{fn}': operand must be per-channel, full-size, or scalar"
         return None
     if k == "maxpool2d":
+        return None
+    if k == "pad":
+        pads = op.attrs["pads"]
+        if op.inputs[0].type.rank < 2 or any(lo or hi for lo, hi in pads[:-2]):
+            return "pad: MNPU-1 pads only the last two axes"
         return None
     if k in UNARY or k in BINARY or k in ("where", "broadcast"):
         for v in op.inputs:
@@ -149,7 +165,7 @@ def check(op: ir.Op, cfg: Config) -> Optional[str]:
     reasons = {
         "concat": "concat: not implemented",
         "slice": "slice: not implemented",
-        "pad": "pad: not implemented",
+
         "cast": "cast: MNPU-1 is fp16-only",
     }
     return reasons.get(k, f"{k}: not supported by MNPU-1")
@@ -184,7 +200,8 @@ def tile_candidates(d: int) -> list[int]:
     return sorted({min(d, 1 << p) for p in range(5, 13)})
 
 
-def choose_matmul_tiles(M: int, K: int, N: int, n_epi: int, slots: int, cfg: Config) -> tuple[int, int, int]:
+def choose_matmul_tiles(M: int, K: int, N: int, n_epi: int, slots: int, cfg: Config,
+                        acc_reserve: int = 0) -> tuple[int, int, int]:
     """Pick (tm, tk, tn) minimizing DRAM traffic subject to SRAM/accumulator capacity.
 
     DRAM traffic (in elements) for an output-stationary loop nest is roughly
@@ -199,7 +216,7 @@ def choose_matmul_tiles(M: int, K: int, N: int, n_epi: int, slots: int, cfg: Con
             for tk in tile_candidates(K):
                 sram_banks = slots * (math.ceil(tm * tk / sb) + math.ceil(tk * tn / sb)
                                       + (n_epi + 1) * math.ceil(tm * tn / sb))
-                acc_banks = slots * math.ceil(tm * tn / ab)
+                acc_banks = slots * math.ceil(tm * tn / ab) + acc_reserve
                 if sram_banks * sb > cfg.sram_elems or acc_banks * ab > cfg.acc_elems:
                     continue
                 traffic = M * K * math.ceil(N / tn) + K * N * math.ceil(M / tm)
@@ -311,12 +328,14 @@ class CodeGen:
             self.place(op.result)
             epi = "".join(f"+{fn}" for fn, _, _ in op.attrs.get("epilogue", ()))
             self.current_op = f"{op.kind}{epi} {op.result!r}"
-            if op.kind == "matmul":
+            if op.kind in ("matmul", "qmatmul"):
                 self.matmul(op)
-            elif op.kind == "conv2d":
+            elif op.kind in ("conv2d", "qconv2d"):
                 self.conv2d(op)
             elif op.kind == "maxpool2d":
                 self.maxpool2d(op)
+            elif op.kind == "pad":
+                self.pad(op)
             elif op.kind == "transpose":
                 self.transpose(op)
             elif op.kind in ("softmax", "layernorm") or op.kind.startswith("reduce_"):
@@ -339,18 +358,36 @@ class CodeGen:
 
     # ----- matmul
 
-    def matmul(self, op: ir.Op) -> None:
-        x, w = op.inputs[0], op.inputs[1]
+    def int8_constants(self, op: ir.Op, scale_shape: tuple[int, int]) -> tuple[str, str, str]:
+        """Storage for a W8A8 op: int8 weights, the activation scale, and the combined output scales (fp32)."""
         out = op.result
+        a = op.attrs
+        qname, xname, sname = f"t{out.id}_q", f"t{out.id}_xs", f"t{out.id}_os"
+        q = a["q"] if op.kind == "qmatmul" else np.ascontiguousarray(a["q"].transpose(2, 3, 0, 1))
+        self.sizes[qname] = (q.size, np.int8)
+        self.consts[qname] = q.ravel()
+        self.sizes[xname] = (1, np.float32)
+        self.consts[xname] = np.array([a["x_scale"]], np.float32)
+        combined = (np.float64(a["x_scale"]) * a["w_scale"].astype(np.float64)).astype(np.float32)
+        self.sizes[sname] = (combined.size, np.float32)
+        self.consts[sname] = combined.reshape(scale_shape).ravel()
+        return qname, xname, sname
+
+    def matmul(self, op: ir.Op) -> None:
+        int8 = op.kind == "qmatmul"
+        x, out = op.inputs[0], op.result
+        w = None if int8 else op.inputs[1]
         epi = op.attrs.get("epilogue", ())
-        K, N = w.type.shape[-2], w.type.shape[-1]
-        if w.type.rank == 2:        # shared weights: fold all leading dims of x into M
+        K, N = op.attrs["q"].shape if int8 else (w.type.shape[-2], w.type.shape[-1])
+        if int8 or w.type.rank == 2:        # shared weights: fold all leading dims of x into M
             batches, M = 1, int(np.prod(x.type.shape[:-1], dtype=np.int64))
-        else:                       # true batched matmul: loop over the batch
+        else:                               # true batched matmul: loop over the batch
             batches, M = int(np.prod(x.type.shape[:-2], dtype=np.int64)), x.type.shape[-2]
         n_epi = sum(1 for _, idx, _ in epi if idx is not None)
-        tm, tk, tn = choose_matmul_tiles(M, K, N, n_epi, self.slots, self.cfg)
-        qnote = " int8 weights" if w in self.quant else ""
+        tm, tk, tn = choose_matmul_tiles(M, K, N, n_epi, self.slots, self.cfg, acc_reserve=2 if int8 else 0)
+        if int8:
+            qname, xname, sname = self.int8_constants(op, (1, N))
+        qnote = " int8 weights + int8 math (W8A8)" if int8 else " int8 weights" if w in self.quant else ""
         self.notes.append(f"matmul {out!r}: M={M} K={K} N={N} x{batches} -> tiles tm={tm} tk={tk} tn={tn}{qnote}"
                           + (f", epilogue {[s[0] for s in epi]}" if epi else ""))
 
@@ -360,6 +397,10 @@ class CodeGen:
         E = [[sram.alloc(tm, tn) for _ in range(n_epi)] for _ in range(self.slots)]
         O = [sram.alloc(tm, tn) for _ in range(self.slots)]
         C = [acc.alloc(tm, tn) for _ in range(self.slots)]
+        if int8:          # scales live in the fp32 accumulator memory, so they keep full precision
+            xs_t = acc.alloc(1, 1)
+            os_buf = acc.alloc(1, tn)
+            self.emit(Load(xs_t, DramRegion(xname, 1, 0, 1, 0, 1)), "activation scale")
 
         ab = tile_no = 0
         for b in range(batches):
@@ -375,11 +416,19 @@ class CodeGen:
                         a_t = Tile("sram", A[t].addr, mm, kn)
                         b_t = Tile("sram", B[t].addr, kn, nn)
                         self.load(a_t, x, self.region(x, b * M + i, mm, kk, kn), comment=f"A tile ({i},{kk}) slot {t}")
-                        w_row = (b * K if w.type.rank > 2 else 0) + kk
-                        self.load(b_t, w, self.region(w, w_row, kn, j, nn), scale_cols=(j, nn),
-                                  comment=f"B tile ({kk},{j}) slot {t}")
-                        self.emit(MatMul(c, a_t, b_t, accumulate=kk > 0))
+                        if int8:
+                            self.emit(Vec("quant", a_t, [(a_t, FULL), (xs_t, SCALAR)]), "quantize activations to int8")
+                            self.emit(Load(b_t, DramRegion(qname, N, kk, kn, j, nn)), f"int8 B tile ({kk},{j})")
+                        else:
+                            w_row = (b * K if w.type.rank > 2 else 0) + kk
+                            self.load(b_t, w, self.region(w, w_row, kn, j, nn), scale_cols=(j, nn),
+                                      comment=f"B tile ({kk},{j}) slot {t}")
+                        self.emit(MatMul(c, a_t, b_t, accumulate=kk > 0, int8=int8))
                         ab += 1
+                    if int8:          # int32 sums -> real values: times x_scale * w_scale[column]
+                        os_t = Tile("acc", os_buf.addr, 1, nn)
+                        self.emit(Load(os_t, DramRegion(sname, N, 0, 1, j, nn)), "output scales")
+                        self.emit(Vec("mul", c, [(c, FULL), (os_t, ROW)]), "dequantize")
                     self.epilogue(op, c, E[s], lambda v, mode: self.operand_region(v, mode, b * M + i, mm, j, nn),
                                   lambda v: bcast_mode_of(op, v))
                     o_t = Tile("sram", O[s].addr, mm, nn)
@@ -403,37 +452,51 @@ class CodeGen:
 
     # ----- conv2d as implicit GEMM
 
+    def pad_planes(self, x: ir.Value, ph: int, pw: int, tag: str) -> tuple[str, int, int]:
+        """Copy x [N, C, H, W] into the interior of a zeroed DRAM buffer, by DMA. Returns (name, Hp, Wp)."""
+        n_, c_, h_, w_ = x.type.shape
+        if not (ph or pw):
+            return self.storage[x][0], h_, w_
+        hp, wp = h_ + 2 * ph, w_ + 2 * pw
+        name = self.scratch(f"{tag}_pad", n_ * c_ * hp * wp)
+        sram, _ = self.fresh()
+        rows_per = max(1, min(h_, MAX_BUF // w_))
+        bufs = [sram.alloc(rows_per, w_) for _ in range(self.slots)]
+        k = 0
+        for plane in range(n_ * c_):
+            for r in range(0, h_, rows_per):
+                nr = min(rows_per, h_ - r)
+                t = Tile("sram", bufs[k % self.slots].addr, nr, w_)
+                self.emit(Load(t, self.region(x, plane * h_ + r, nr, 0, w_)), "pad: copy in")
+                self.emit(Store(DramRegion(name, wp, plane * hp + ph + r, nr, pw, w_), t), "pad: copy out")
+                k += 1
+        return name, hp, wp
+
     def conv2d(self, op: ir.Op) -> None:
-        x, w = op.inputs[0], op.inputs[1]
+        int8 = op.kind == "qconv2d"
+        x = op.inputs[0]
+        w = None if int8 else op.inputs[1]
+        wshape = op.attrs["q"].shape if int8 else w.type.shape
+        o_, cg, kh, kw = wshape
+        groups = op.attrs.get("groups", 1)
+        if not int8 and groups > 1 and cg == 1 and o_ == groups:
+            return self.depthwise_conv2d(op)
         out = op.result
         n_, c_, h_, w_ = x.type.shape
-        o_, _, kh, kw = w.type.shape
         _, _, oh_, ow_ = out.type.shape
-        (sh, sw), (ph, pw) = op.attrs["stride"], op.attrs["padding"]
+        (sh, sw), (ph, pw), (dh, dw), _ = conv_params(op.attrs)
+        og = o_ // groups
 
-        # 1. padding: copy x into the interior of a zeroed DRAM buffer, by DMA
-        if ph or pw:
-            hp, wp = h_ + 2 * ph, w_ + 2 * pw
-            pad_name = self.scratch(f"t{out.id}_pad", n_ * c_ * hp * wp)
-            sram, _ = self.fresh()
-            rows_per = max(1, min(h_, MAX_BUF // w_))
-            bufs = [sram.alloc(rows_per, w_) for _ in range(self.slots)]
-            k = 0
-            for plane in range(n_ * c_):
-                for r in range(0, h_, rows_per):
-                    nr = min(rows_per, h_ - r)
-                    t = Tile("sram", bufs[k % self.slots].addr, nr, w_)
-                    self.emit(Load(t, self.region(x, plane * h_ + r, nr, 0, w_)), "pad: copy in")
-                    self.emit(Store(DramRegion(pad_name, wp, plane * hp + ph + r, nr, pw, w_), t), "pad: copy out")
-                    k += 1
-            src_name, src_h, src_w = pad_name, hp, wp
-        else:
-            src_name, src_h, src_w = self.storage[x][0], h_, w_
+        # 1. padding, by DMA into a zeroed buffer
+        src_name, src_h, src_w = self.pad_planes(x, ph, pw, f"t{out.id}")
 
-        # 2. weights, rearranged at compile time to [KH, KW, O, C] so each tap (i, j) is a contiguous [O, C] block
-        wp_ = w.producer
+        # 2. weights, rearranged at compile time to [KH, KW, O, C/groups]: each tap (i, j) is a contiguous block
+        wp_ = None if int8 else w.producer
         wname = f"t{out.id}_w"
-        if wp_ is not None and wp_.kind == "dequantize":
+        if int8:
+            wname, xname, sname = self.int8_constants(op, (o_, 1))
+            scale_name = None
+        elif wp_ is not None and wp_.kind == "dequantize":
             q = np.ascontiguousarray(wp_.attrs["q"].transpose(2, 3, 0, 1))
             self.sizes[wname] = (q.size, np.int8)
             self.consts[wname] = q.ravel()
@@ -446,19 +509,19 @@ class CodeGen:
         else:
             raise NotImplementedError("conv2d with runtime weights")   # check() keeps these off the NPU
 
-        # 3. tiles: rows = output channels, cols = output pixels of one row, K = input channels
-        to, tw, tc = min(o_, 128), min(ow_, 512), min(c_, 512)
+        # 3. tiles: rows = output channels, cols = output pixels of one row, K = input channels (per group)
+        to, tw, tc = min(og, 128), min(ow_, 512), min(cg, 512)
         sram, acc = self.fresh()
-        resident = kh * kw * o_ * c_ <= sram.free_elems() // 2 and tc == c_
+        resident = kh * kw * o_ * cg <= sram.free_elems() // 2 and tc == cg
         n_epi = sum(1 for _, idx, _ in op.attrs.get("epilogue", ()) if idx is not None)
         if resident:     # weight-stationary: load all weights once, reuse for every output row
-            W = sram.alloc(kh * kw * o_, c_)
+            W = sram.alloc(kh * kw * o_, cg)
             if scale_name is None:
-                self.emit(Load(W, DramRegion(wname, c_, 0, kh * kw * o_, 0, c_)), "all weights, loaded once")
+                self.emit(Load(W, DramRegion(wname, cg, 0, kh * kw * o_, 0, cg)), "all weights, loaded once")
             else:            # int8: dequantize each tap with the per-output-channel scales
                 for tap in range(kh * kw):
-                    self.emit(Load(Tile("sram", W.addr + tap * o_ * c_, o_, c_),
-                                   DramRegion(wname, c_, tap * o_, o_, 0, c_),
+                    self.emit(Load(Tile("sram", W.addr + tap * o_ * cg, o_, cg),
+                                   DramRegion(wname, cg, tap * o_, o_, 0, cg),
                                    scale=DramRegion(scale_name, 1, 0, o_, 0, 1), scale_axis=0),
                               f"weights tap {tap}, loaded once")
             A = []
@@ -468,50 +531,166 @@ class CodeGen:
         E = [[sram.alloc(to, tw) for _ in range(n_epi)] for _ in range(self.slots)]
         O = [sram.alloc(to, tw) for _ in range(self.slots)]
         C = [acc.alloc(to, tw) for _ in range(self.slots)]
-        self.notes.append(f"conv2d {out!r}: implicit GEMM, {kh}x{kw} taps, tiles o={to} ow={tw} c={tc}"
-                          + (", weights resident in SRAM" if resident else "") + (", int8" if scale_name else ""))
+        if int8:
+            xs_t = acc.alloc(1, 1)
+            os_buf = acc.alloc(to, 1)
+            self.emit(Load(xs_t, DramRegion(xname, 1, 0, 1, 0, 1)), "activation scale")
+        self.notes.append(f"conv2d {out!r}: implicit GEMM, {kh}x{kw} taps" + (" in int8 (W8A8)" if int8 else "")
+                          + (f", {groups} groups" if groups > 1 else "") + (f", dilation {dh}x{dw}" if dh > 1 or dw > 1
+                                                                          else "")
+                          + f", tiles o={to} ow={tw} c={tc}" + (", weights resident in SRAM" if resident else "")
+                          + (", int8" if scale_name else ""))
 
         ab = tile_no = 0
         for n in range(n_):
             for oh in range(oh_):
-                for o0 in range(0, o_, to):
-                    on = min(to, o_ - o0)
+                for g in range(groups):
+                    for o0 in range(g * og, (g + 1) * og, to):      # absolute output channel
+                        on = min(to, (g + 1) * og - o0)
+                        for w0 in range(0, ow_, tw):
+                            wn = min(tw, ow_ - w0)
+                            s = tile_no % self.slots
+                            c = Tile("acc", C[s].addr, on, wn)
+                            first = True
+                            for i in range(kh):
+                                for j in range(kw):
+                                    for c0 in range(0, cg, tc):      # input channel within the group
+                                        cn = min(tc, cg - c0)
+                                        t = ab % self.slots
+                                        tap = i * kw + j
+                                        if resident:
+                                            a_t = Tile("sram", W.addr + (tap * o_ + o0) * cg, on, cg)
+                                        else:
+                                            a_t = Tile("sram", A[t].addr, on, cn)
+                                            self.emit(Load(a_t, DramRegion(wname, cg, tap * o_ + o0, on, c0, cn),
+                                                           scale=DramRegion(scale_name, 1, o0, on, 0, 1) if scale_name
+                                                           else None, scale_axis=0), f"weights tap ({i},{j})")
+                                        b_t = Tile("sram", B[t].addr, cn, wn)
+                                        row0 = (n * c_ + g * cg + c0) * src_h + oh * sh + i * dh
+                                        self.emit(Load(b_t, DramRegion(src_name, src_w, row0, cn, w0 * sw + j * dw, wn,
+                                                                       row_stride=src_h, col_stride=sw)),
+                                                  f"input rows for tap ({i},{j})")
+                                        if int8:
+                                            self.emit(Vec("quant", b_t, [(b_t, FULL), (xs_t, SCALAR)]),
+                                                      "quantize activations to int8")
+                                        self.emit(MatMul(c, a_t, b_t, accumulate=not first, int8=int8))
+                                        first = False
+                                        ab += 1
+                            out_row = (n * o_ + o0) * oh_ + oh
+                            if int8:      # int32 sums -> real values, per output channel (one per tile row)
+                                os_t = Tile("acc", os_buf.addr, on, 1)
+                                self.emit(Load(os_t, DramRegion(sname, 1, o0, on, 0, 1)), "output scales")
+                                self.emit(Vec("mul", c, [(c, FULL), (os_t, COL)]), "dequantize")
+                            self.epilogue(
+                                op, c, E[s],
+                                lambda v, mode: (self.region(v, out_row, on, w0, wn, row_stride=oh_) if mode == FULL
+                                                 else self.operand_region(v, mode, o0, on, 0, 1)),
+                                lambda v: conv_channel_mode(v.type.shape, out.type.shape))
+                            o_t = Tile("sram", O[s].addr, on, wn)
+                            self.emit(Vec("copy", o_t, [(c, FULL)]), "writeback fp32 -> fp16")
+                            self.emit(Store(self.region(out, out_row, on, w0, wn, row_stride=oh_), o_t))
+                            tile_no += 1
+
+    def depthwise_conv2d(self, op: ir.Op) -> None:
+        """One filter per channel. The matrix unit would multiply 1x1 tiles here, so (like real NPUs) this runs
+        on the vector unit instead: for each kernel tap, acc += input_rows * per-channel weight."""
+        x, w = op.inputs[0], op.inputs[1]
+        out = op.result
+        n_, c_, h_, w_ = x.type.shape
+        _, _, kh, kw = w.type.shape
+        _, _, oh_, ow_ = out.type.shape
+        (sh, sw), (ph, pw), (dh, dw), _ = conv_params(op.attrs)
+        src_name, src_h, src_w = self.pad_planes(x, ph, pw, f"t{out.id}")
+        wp_ = w.producer
+        if wp_ is None or not wp_.is_constant_like:
+            raise NotImplementedError("depthwise conv2d with runtime weights")
+        from ...ops import evaluate
+        wv = evaluate(wp_.kind, [], wp_.attrs) if wp_.kind == "dequantize" else wp_.attrs["value"]
+        wname = f"t{out.id}_dw"
+        taps = np.ascontiguousarray(wv.astype(np.float16).reshape(c_, kh * kw).T)     # [KH*KW, C]
+        self.sizes[wname] = (taps.size, np.float16)
+        self.consts[wname] = taps.ravel()
+
+        tw = min(ow_, 512)
+        tc = max(1, min(c_, MAX_BUF // tw))
+        sram, acc = self.fresh()
+        Wt = sram.alloc(kh * kw * c_, 1)
+        self.emit(Load(Wt, DramRegion(wname, 1, 0, kh * kw * c_, 0, 1)), "all depthwise weights, loaded once")
+        n_epi = sum(1 for _, idx, _ in op.attrs.get("epilogue", ()) if idx is not None)
+        B = [sram.alloc(tc, tw) for _ in range(self.slots)]
+        E = [[sram.alloc(tc, tw) for _ in range(n_epi)] for _ in range(self.slots)]
+        O = [sram.alloc(tc, tw) for _ in range(self.slots)]
+        C = [acc.alloc(tc, tw) for _ in range(self.slots)]
+        self.notes.append(f"conv2d {out!r}: depthwise on the vector unit, {kh}x{kw} taps, tiles c={tc} ow={tw}")
+        ab = tile_no = 0
+        for n in range(n_):
+            for oh in range(oh_):
+                for c0 in range(0, c_, tc):
+                    cn = min(tc, c_ - c0)
                     for w0 in range(0, ow_, tw):
                         wn = min(tw, ow_ - w0)
                         s = tile_no % self.slots
-                        c = Tile("acc", C[s].addr, on, wn)
-                        first = True
+                        a = Tile("acc", C[s].addr, cn, wn)
                         for i in range(kh):
                             for j in range(kw):
-                                for c0 in range(0, c_, tc):
-                                    cn = min(tc, c_ - c0)
-                                    t = ab % self.slots
-                                    tap = i * kw + j
-                                    if resident:
-                                        a_t = Tile("sram", W.addr + (tap * o_ + o0) * c_, on, c_)
-                                    else:
-                                        a_t = Tile("sram", A[t].addr, on, cn)
-                                        self.emit(Load(a_t, DramRegion(wname, c_, tap * o_ + o0, on, c0, cn),
-                                                       scale=DramRegion(scale_name, 1, o0, on, 0, 1) if scale_name
-                                                       else None, scale_axis=0), f"weights tap ({i},{j})")
-                                    b_t = Tile("sram", B[t].addr, cn, wn)
-                                    row0 = (n * c_ + c0) * src_h + oh * sh + i
-                                    self.emit(Load(b_t, DramRegion(src_name, src_w, row0, cn, w0 * sw + j, wn,
-                                                                   row_stride=src_h, col_stride=sw)),
-                                              f"input rows for tap ({i},{j})")
-                                    self.emit(MatMul(c, a_t, b_t, accumulate=not first))
-                                    first = False
-                                    ab += 1
-                        out_row = (n * o_ + o0) * oh_ + oh
+                                tap = i * kw + j
+                                b_t = Tile("sram", B[ab % self.slots].addr, cn, wn)
+                                row0 = (n * c_ + c0) * src_h + oh * sh + i * dh
+                                self.emit(Load(b_t, DramRegion(src_name, src_w, row0, cn, w0 * sw + j * dw, wn,
+                                                               row_stride=src_h, col_stride=sw)),
+                                          f"input rows for tap ({i},{j})")
+                                wt = Tile("sram", Wt.addr + tap * c_ + c0, cn, 1)
+                                if tap == 0:
+                                    self.emit(Vec("mul", a, [(b_t, FULL), (wt, COL)]))
+                                else:
+                                    self.emit(Vec("fma", a, [(a, FULL), (b_t, FULL), (wt, COL)]))
+                                ab += 1
+                        out_row = (n * c_ + c0) * oh_ + oh
                         self.epilogue(
-                            op, c, E[s],
-                            lambda v, mode: (self.region(v, out_row, on, w0, wn, row_stride=oh_) if mode == FULL
-                                             else self.operand_region(v, mode, o0, on, 0, 1)),
+                            op, a, E[s],
+                            lambda v, mode: (self.region(v, out_row, cn, w0, wn, row_stride=oh_) if mode == FULL
+                                             else self.operand_region(v, mode, c0, cn, 0, 1)),
                             lambda v: conv_channel_mode(v.type.shape, out.type.shape))
-                        o_t = Tile("sram", O[s].addr, on, wn)
-                        self.emit(Vec("copy", o_t, [(c, FULL)]), "writeback fp32 -> fp16")
-                        self.emit(Store(self.region(out, out_row, on, w0, wn, row_stride=oh_), o_t))
+                        o_t = Tile("sram", O[s].addr, cn, wn)
+                        self.emit(Vec("copy", o_t, [(a, FULL)]), "writeback fp32 -> fp16")
+                        self.emit(Store(self.region(out, out_row, cn, w0, wn, row_stride=oh_), o_t))
                         tile_no += 1
+
+    # ----- pad
+
+    def pad(self, op: ir.Op) -> None:
+        """Pad the last two axes: fill the output with the pad value, then DMA the input into its interior."""
+        x, out = op.inputs[0], op.result
+        (top, bottom), (left, right) = op.attrs["pads"][-2:]
+        value = float(op.attrs.get("value", 0.0))
+        R, Wd = (x.type.shape[-2], x.type.shape[-1]) if x.type.rank >= 2 else (1, x.type.shape[-1])
+        planes = int(np.prod(x.type.shape[:-2], dtype=np.int64)) if x.type.rank >= 2 else 1
+        Rp, Wp = R + top + bottom, Wd + left + right
+        sram, _ = self.fresh()
+        if value != 0.0:      # DRAM buffers start zeroed; anything else has to be written
+            vname = f"t{out.id}_fill"
+            self.sizes[vname] = (1, np.float16)
+            self.consts[vname] = np.array([value], np.float16)
+            v_t = sram.alloc(1, 1)
+            self.emit(Load(v_t, DramRegion(vname, 1, 0, 1, 0, 1)), "pad value")
+            total = planes * Rp
+            tr = max(1, min(total, MAX_BUF // Wp))
+            f_t = sram.alloc(tr, Wp)
+            for r in range(0, total, tr):
+                nr = min(tr, total - r)
+                t = Tile("sram", f_t.addr, nr, Wp)
+                self.emit(Vec("copy", t, [(v_t, SCALAR)]), "fill with the pad value")
+                self.emit(Store(self.region(out, r, nr, 0, Wp), t))
+        rows_per = max(1, min(R, MAX_BUF // Wd))
+        bufs = [sram.alloc(rows_per, Wd) for _ in range(self.slots)]
+        k = 0
+        for plane in range(planes):
+            for r in range(0, R, rows_per):
+                nr = min(rows_per, R - r)
+                t = Tile("sram", bufs[k % self.slots].addr, nr, Wd)
+                self.emit(Load(t, self.region(x, plane * R + r, nr, 0, Wd)), "pad: copy in")
+                self.emit(Store(self.region(out, plane * Rp + top + r, nr, left, Wd), t), "pad: copy out")
+                k += 1
 
     # ----- maxpool2d
 

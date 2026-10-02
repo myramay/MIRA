@@ -43,3 +43,11 @@ def test_training_learns_the_pattern_task():
     line = next(ln for ln in r.stdout.splitlines() if ln.startswith("generation:"))
     correct, total = map(int, line.split()[1].split("/"))
     assert correct / total > 0.95, r.stdout
+
+
+def test_text_gpt_learns_to_write():
+    """The character-level GPT (2 layers, trained on nursery rhymes) continues a rhyme from its first words."""
+    r = subprocess.run([sys.executable, "examples/gpt_text_train.py", "--steps", "700"], capture_output=True,
+                       text=True, timeout=900)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "'twinkle, twinkle, little star,\\nhow i wonder" in r.stdout, r.stdout

@@ -905,14 +905,38 @@ def _flatten(el: Elaborator, a, loc):
 
 
 def _conv2d(el: Elaborator, a, loc):
-    return el.op("conv2d", [el.tensor(a["x"]), el.tensor(a["w"])],
-                 {"stride": el.pair(a["stride"]), "padding": el.pair(a["padding"])}, loc)
+    attrs = {"stride": el.pair(a["stride"]), "padding": el.pair(a["padding"])}
+    if a["dilation"][0] != 1:
+        attrs["dilation"] = el.pair(a["dilation"])
+    if a["groups"][0] != 1:
+        attrs["groups"] = el.int_(a["groups"])
+    return el.op("conv2d", [el.tensor(a["x"]), el.tensor(a["w"])], attrs, loc)
+
+
+def _pool_input(el: Elaborator, a, loc, fill: float) -> ir.Value:
+    """Pooling with padding: pad the image first, with -inf for max pooling so padding never wins."""
+    x = el.tensor(a["x"])
+    ph, pw = el.pair(a["padding"])
+    if ph or pw:
+        x = el.op("pad", [x], {"pads": ((0, 0), (0, 0), (ph, ph), (pw, pw)), "value": fill}, loc)
+    return x
 
 
 def _maxpool(el: Elaborator, a, loc):
     size = el.int_(a["size"])
     stride = size if a["stride"][0] is None else el.int_(a["stride"])
-    return el.op("maxpool2d", [el.tensor(a["x"])], {"size": size, "stride": stride}, loc)
+    x = _pool_input(el, a, loc, -np.inf)
+    return el.op("maxpool2d", [x], {"size": size, "stride": stride}, loc)
+
+
+def _avgpool(el: Elaborator, a, loc):
+    """Average pooling is a depthwise convolution with a constant 1/(k*k) kernel."""
+    size = el.int_(a["size"])
+    stride = size if a["stride"][0] is None else el.int_(a["stride"])
+    x = _pool_input(el, a, loc, 0.0)
+    c = x.type.shape[1]
+    w = el.graph.const(np.full((c, 1, size, size), 1.0 / (size * size), dtype=x.type.np_dtype), loc)
+    return el.op("conv2d", [x, w], {"stride": (stride, stride), "padding": (0, 0), "groups": c}, loc)
 
 
 def _layernorm(el: Elaborator, a, loc):
@@ -977,7 +1001,10 @@ def _pad(el: Elaborator, a, loc):
     if not isinstance(raw, list) or not all(isinstance(p, list) and len(p) == 2 for p in raw):
         raise MiraError("pad() takes pads like [[1, 1], [0, 2]]: one [before, after] pair per axis", ploc)
     pads = tuple((el.ct_int(p[0], ploc), el.ct_int(p[1], ploc)) for p in raw)
-    return el.op("pad", [x], {"pads": pads}, loc)
+    attrs = {"pads": pads}
+    if a["value"][0] != 0:
+        attrs["value"] = el.float_(a["value"])
+    return el.op("pad", [x], attrs, loc)
 
 
 def _dtype_arg(el: Elaborator, arg) -> str:
@@ -1057,7 +1084,7 @@ BUILTINS: dict[str, tuple[list[tuple[str, object]], object]] = {
     "grad": ([("y", REQUIRED), ("wrt", REQUIRED)], _grad),
     "where": ([("cond", REQUIRED), ("a", REQUIRED), ("b", REQUIRED)], _where),
     "slice": ([("x", REQUIRED), ("begin", REQUIRED), ("size", REQUIRED)], _slice),
-    "pad": ([("x", REQUIRED), ("pads", REQUIRED)], _pad),
+    "pad": ([("x", REQUIRED), ("pads", REQUIRED), ("value", 0)], _pad),
     "broadcast": ([("x", REQUIRED), ("shape", REQUIRED)], _broadcast),
     "maximum": _binary_fn("maximum"),
     "minimum": _binary_fn("minimum"),
@@ -1071,8 +1098,10 @@ BUILTINS: dict[str, tuple[list[tuple[str, object]], object]] = {
     "transpose": ([("x", REQUIRED), ("perm", None)], _transpose),
     "reshape": ([("x", REQUIRED), ("shape", REQUIRED)], _reshape),
     "flatten": ([("x", REQUIRED), ("axis", 1)], _flatten),
-    "conv2d": ([("x", REQUIRED), ("w", REQUIRED), ("stride", 1), ("padding", 0)], _conv2d),
-    "maxpool2d": ([("x", REQUIRED), ("size", 2), ("stride", None)], _maxpool),
+    "conv2d": ([("x", REQUIRED), ("w", REQUIRED), ("stride", 1), ("padding", 0), ("dilation", 1), ("groups", 1)],
+               _conv2d),
+    "maxpool2d": ([("x", REQUIRED), ("size", 2), ("stride", None), ("padding", 0)], _maxpool),
+    "avgpool2d": ([("x", REQUIRED), ("size", 2), ("stride", None), ("padding", 0)], _avgpool),
     "layernorm": ([("x", REQUIRED), ("gamma", REQUIRED), ("beta", REQUIRED), ("eps", 1e-5)], _layernorm),
     "concat": ([("xs", REQUIRED), ("axis", 0)], _concat),
     "cast": ([("x", REQUIRED), ("dtype", REQUIRED)], _cast),

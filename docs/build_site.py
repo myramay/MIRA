@@ -39,7 +39,7 @@ INDEX = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mira: a compiler for neural processing units</title>
+<title>MIRA: a compiler for neural processing units</title>
 <style>
   :root { --bg: #f7f7f5; --panel: #fff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e4e4e0; --accent: #2f6fdf;
           color-scheme: light; }
@@ -74,7 +74,7 @@ INDEX = """<!doctype html>
 </head>
 <body>
 <main>
-  <h1>Mira</h1>
+  <h1>MIRA</h1>
   <p class="lede">A small programming language and compiler for running neural networks on <b>neural processing
   units</b>: the AI chips inside phones and laptops. One program compiles to Apple's Neural Engine, to standard
   MLIR, and to <b>MNPU-1</b>, a simulated NPU you can watch work, instruction by instruction, below.</p>
@@ -94,13 +94,16 @@ INDEX = """<!doctype html>
 __DEMOS__
   </div>
 
-  <h2>What Mira does</h2>
+  <h2>What MIRA does</h2>
   <ul class="facts">
-    <li>Runs on the Apple Neural Engine through Core ML: <b>9.6× faster</b> than NumPy on a 50M-parameter MLP, and
-        <b>1.8× faster again</b> with int8 weights.</li>
+    <li>Runs torchvision's <b>ResNet-18</b> and <b>MobileNetV2</b> entirely on the Apple Neural Engine:
+        <b>5.6×</b> and <b>35×</b> faster than PyTorch on the CPU (1.39 ms and 0.48 ms per 224×224 image).</li>
+    <li><b>int8</b> two ways: int8 weights (1.8× faster on the ANE for a 50M-parameter MLP), or int8 weights
+        <i>and</i> int8 math with calibrated activation scales, on every target.</li>
     <li><b>Trains</b> models on the NPU: <code>grad()</code> differentiates programs at compile time.</li>
     <li>Imports <b>PyTorch models</b> via ONNX (MLPs, CNNs, transformers), matching PyTorch's output.</li>
-    <li>Trains a <b>tiny GPT</b> and generates tokens with a KV cache inside a data-dependent loop.</li>
+    <li>Trains a <b>character-level GPT</b> on nursery rhymes in about 20 seconds, then writes them out one
+        character at a time with a KV cache inside a data-dependent loop.</li>
     <li>Its fuzzer and tests found real bugs in <b>Apple's Core ML</b> and <b>Google's IREE</b>, with workarounds
         and regression tests in the repo.</li>
   </ul>

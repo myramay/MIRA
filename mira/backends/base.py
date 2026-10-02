@@ -7,7 +7,7 @@ import numpy as np
 
 from .. import ir
 
-HEAVY_KINDS = {"matmul", "conv2d", "softmax", "layernorm", "maxpool2d"}
+HEAVY_KINDS = {"matmul", "conv2d", "qmatmul", "qconv2d", "softmax", "layernorm", "maxpool2d"}
 
 
 class Executable(Protocol):

@@ -225,7 +225,7 @@ def _matmul(b, op, g, need):
 @rule("conv2d")
 def _conv2d(b, op, g, need):
     x, w = op.inputs
-    a = dict(stride=op.attrs["stride"], padding=op.attrs["padding"])
+    a = {k: op.attrs[k] for k in ("stride", "padding", "dilation", "groups") if k in op.attrs}
     return [b.op("conv2d_grad_input", g, w, in_shape=x.type.shape, **a) if need[0] else None,
             b.op("conv2d_grad_weight", x, g, w_shape=w.type.shape, **a) if need[1] else None]
 

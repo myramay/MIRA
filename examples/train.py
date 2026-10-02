@@ -1,4 +1,4 @@
-"""Train an MLP with a Mira-compiled training step.
+"""Train an MLP with a MIRA-compiled training step.
 
     python examples/train.py --target coreml     # train on the Apple Neural Engine
     python examples/train.py --target npu-sim    # train on the simulated NPU

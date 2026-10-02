@@ -253,9 +253,10 @@ def compile_source(source: str, target: str = "cpu", *, filename: str = "<input>
                    weights: Optional[dict[str, np.ndarray]] = None, dims: Optional[dict[str, int]] = None,
                    seed: Optional[int] = 0, optimize: bool = True, fuse: bool = True,
                    precision: Optional[str] = "auto", cost_model: bool = True, quantize: Optional[str] = None,
+                   calibration: Optional[list[dict]] = None,
                    dynamic: bool = True, buckets: Optional[dict[str, list[int]]] = None,
                    **target_options) -> Union[CompiledProgram, DynamicProgram]:
-    """Compile Mira source for `target` ("cpu", "npu-sim", or "coreml").
+    """Compile MIRA source for `target` ("cpu", "npu-sim", or "coreml").
 
     precision="auto" lowers to fp16 for accelerator targets (what NPUs compute in)
     and leaves the program's own dtypes alone on the CPU. quantize="int8" stores
@@ -280,12 +281,13 @@ def compile_source(source: str, target: str = "cpu", *, filename: str = "<input>
         e.source = source
         raise
     return compile_ir(graph, target, optimize=optimize, fuse=fuse, precision=precision, cost_model=cost_model,
-                      quantize=quantize, started=t0, **target_options)
+                      quantize=quantize, calibration=calibration, started=t0, **target_options)
 
 
 def compile_ir(graph: ir.Graph, target: str = "cpu", *, optimize: bool = True, fuse: bool = True,
                precision: Optional[str] = "auto", cost_model: bool = True, quantize: Optional[str] = None,
-               started: Optional[float] = None, **target_options) -> CompiledProgram:
+               calibration: Optional[list[dict]] = None, started: Optional[float] = None,
+               **target_options) -> CompiledProgram:
     """The back half of the compiler, shared by every front end: optimize, quantize, partition, compile."""
     t0 = started if started is not None else time.perf_counter()
     if precision == "auto":
@@ -295,7 +297,14 @@ def compile_ir(graph: ir.Graph, target: str = "cpu", *, optimize: bool = True, f
         passes.optimize(graph, fuse=fuse, precision=precision, log=log)
     elif precision == "f16":
         passes.to_f16(graph)
-    if quantize:
+    if quantize == "w8a8":
+        from . import quantize as Q
+        if calibration is None:      # no real data given: calibrate on random inputs (fine for demos, not for accuracy)
+            rng = np.random.default_rng(0)
+            calibration = [{v.name: rng.standard_normal(v.type.shape).astype(v.type.np_dtype) for v in graph.inputs}
+                           for _ in range(4)]
+        Q.quantize_w8a8(graph, calibration, log=log)
+    elif quantize:
         from . import quantize as Q
         Q.quantize_weights(graph, quantize, log=log)
     runner = compile_graph(graph, get_target(target, **target_options), cost_model)

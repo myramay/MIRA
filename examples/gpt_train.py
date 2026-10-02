@@ -8,7 +8,7 @@ The task needs attention: every sequence is a random 4-token pattern repeated
 (e.g. 3 1 4 9 3 1 4 9 ...), so predicting the next token means looking back 4
 positions. Given a 5-token prompt, a trained model continues the pattern.
 
-Mira computes the loss and gradients (`grad` in gpt.mira); Adam runs here, on
+MIRA computes the loss and gradients (`grad` in gpt.mira); Adam runs here, on
 the host, in NumPy, the way optimizers often run next to an accelerator.
 """
 import argparse

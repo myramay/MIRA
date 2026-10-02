@@ -1,0 +1,83 @@
+# A character-level GPT: L transformer layers, trained on real text.
+#
+#   train_step  - loss and gradients for a batch of text windows (the host applies Adam). The gradients
+#                 are of loss * loss_scale: in fp16, small gradients would otherwise round to zero, so the
+#                 loss is scaled up before differentiating and the host divides the gradients back down
+#                 ("loss scaling", as in mixed-precision training on GPUs and NPUs).
+#   generate    - greedy decoding with a per-layer KV cache, one character per while-loop iteration
+#
+# Sizes are shape symbols bound by the caller (examples/gpt_text_train.py):
+#   B batch, T context length, V vocabulary, D width, F MLP width, L layers, P prompt length.
+# Each layer's weights are stacked along a leading L axis; `for l in 0..L` unrolls the layers.
+
+fn causal_mask(n: int) -> f32[n, n] {
+  let allowed = reshape(arange(n), [n, 1]) >= reshape(arange(n), [1, n])
+  return (cast(allowed, f32) - 1) * 10000
+}
+
+fn block(h: f32[B, T, D], wq: f32[D, D], wk: f32[D, D], wv: f32[D, D], wo: f32[D, D],
+         w1: f32[D, F], w2: f32[F, D], g1: f32[D], b1: f32[D], g2: f32[D], b2: f32[D]) -> f32[B, T, D] {
+  let x = layernorm(h, g1, b1)
+  let scores = (x @ wq) @ transpose(x @ wk) / sqrt(D) + causal_mask(T)
+  let y = h + (softmax(scores) @ (x @ wv)) @ wo
+  return y + gelu(layernorm(y, g2, b2) @ w1) @ w2
+}
+
+fn logits(tok: i32[B, T], emb: f32[V, D], pos: f32[T, D],
+          wq: f32[L, D, D], wk: f32[L, D, D], wv: f32[L, D, D], wo: f32[L, D, D],
+          w1: f32[L, D, F], w2: f32[L, F, D],
+          g1: f32[L, D], b1: f32[L, D], g2: f32[L, D], b2: f32[L, D],
+          gf: f32[D], bf: f32[D], wout: f32[D, V]) -> f32[B, T, V] {
+  let h = emb[tok] + pos
+  for l in 0..L {
+    h = block(h, wq[l], wk[l], wv[l], wo[l], w1[l], w2[l], g1[l], b1[l], g2[l], b2[l])
+  }
+  return layernorm(h, gf, bf) @ wout
+}
+
+fn train_step(tok: i32[B, T],
+              emb: f32[V, D], pos: f32[T, D],
+              wq: f32[L, D, D], wk: f32[L, D, D], wv: f32[L, D, D], wo: f32[L, D, D],
+              w1: f32[L, D, F], w2: f32[L, F, D],
+              g1: f32[L, D], b1: f32[L, D], g2: f32[L, D], b2: f32[L, D],
+              gf: f32[D], bf: f32[D], wout: f32[D, V], loss_scale: int)
+    -> (f32[], f32[V, D], f32[T, D], f32[L, D, D], f32[L, D, D], f32[L, D, D], f32[L, D, D],
+        f32[L, D, F], f32[L, F, D], f32[L, D], f32[L, D], f32[L, D], f32[L, D], f32[D], f32[D], f32[D, V]) {
+  let lg = logits(tok, emb, pos, wq, wk, wv, wo, w1, w2, g1, b1, g2, b2, gf, bf, wout)[:, 0:T - 1]
+  let z = lg - max(lg, axis=2, keepdims=true)
+  let log_probs = z - log(sum(exp(z), axis=2, keepdims=true))
+  let target = reshape(tok[:, 1:], [B, T - 1, 1]) == reshape(arange(V), [1, 1, V])
+  let loss = -sum(cast(target, f32) * log_probs) / (B * (T - 1))
+  let d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14 =
+    grad(loss * loss_scale, [emb, pos, wq, wk, wv, wo, w1, w2, g1, b1, g2, b2, gf, bf, wout])
+  return loss, d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14
+}
+
+fn generate(prompt: i32[P],
+            const emb: f32[V, D], const pos: f32[T, D],
+            const wq: f32[L, D, D], const wk: f32[L, D, D], const wv: f32[L, D, D], const wo: f32[L, D, D],
+            const w1: f32[L, D, F], const w2: f32[L, F, D],
+            const g1: f32[L, D], const b1: f32[L, D], const g2: f32[L, D], const b2: f32[L, D],
+            const gf: f32[D], const bf: f32[D], const wout: f32[D, V]) -> i32[T] {
+  let tokens = zeros([T], i32)
+  tokens[0:P] = prompt
+  let kcache = zeros([L, T, D])
+  let vcache = zeros([L, T, D])
+  let t = zeros([], i32)
+  while t < T - 1 {
+    let h = reshape(emb[tokens[t]], [1, D]) + dynamic_slice(pos, [t, 0], [1, D])
+    let seen = cast(reshape(arange(T), [1, T]) <= t, f32)          # cache rows 0..t are valid
+    for l in 0..L {
+      let x = layernorm(h, g1[l], b1[l])
+      kcache[l, t] = reshape(x @ wk[l], [D])
+      vcache[l, t] = reshape(x @ wv[l], [D])
+      let scores = (x @ wq[l]) @ transpose(kcache[l]) / sqrt(D) + (seen - 1) * 10000
+      h = h + (softmax(scores) @ vcache[l]) @ wo[l]
+      h = h + gelu(layernorm(h, g2[l], b2[l]) @ w1[l]) @ w2[l]
+    }
+    let next = argmax(layernorm(h, gf, bf) @ wout, axis=1)[0]
+    tokens[t + 1] = where(t + 1 < P, tokens[t + 1], next)          # keep the prompt, then predict
+    t = t + 1
+  }
+  return tokens
+}

@@ -1,6 +1,6 @@
 """Graph partitioning: split the graph between the accelerator and the CPU.
 
-This is what lets Mira run *any* program on an NPU target: every op the
+This is what lets MIRA run *any* program on an NPU target: every op the
 accelerator supports goes there, everything else falls back to the CPU, and
 data moves between them at segment boundaries.
 

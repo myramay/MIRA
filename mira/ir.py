@@ -1,4 +1,4 @@
-"""Mira's intermediate representation (IR).
+"""MIRA's intermediate representation (IR).
 
 A `Graph` is a list of `Op`s in SSA form: every `Value` is defined exactly once
 (by an op, or as a graph input) and ops appear in a valid execution order.

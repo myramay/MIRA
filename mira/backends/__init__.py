@@ -15,7 +15,7 @@ def get_target(name: str, **options):
         return SimTarget(cfg, double_buffer=options.get("double_buffer", True), fast=options.get("sim_fast", False))
     if name in ("coreml", "ane"):
         from .coreml import CoreMLTarget
-        return CoreMLTarget(units=options.get("units", "ne"))
+        return CoreMLTarget(units=options.get("units", "ne"), cache=options.get("cache", True))
     if name in ("mlir", "iree"):
         from .mlir import MLIRTarget
         return MLIRTarget(backend=options.get("mlir_backend", "cpu"))

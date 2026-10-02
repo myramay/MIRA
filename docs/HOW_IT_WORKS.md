@@ -1,6 +1,6 @@
-# How Mira works
+# How MIRA works
 
-Mira turns a short program describing a neural network into instructions for an AI chip. This page follows one
+MIRA turns a short program describing a neural network into instructions for an AI chip. This page follows one
 program through every stage, then explains the simulated chip, how the compiler is tested, and the bugs that
 testing found. Everything shown is real output from `mira emit`.
 
@@ -92,7 +92,14 @@ weights, removing duplicated or unused work, and, most importantly, **fusion**:
 The bias add and the relu are now an *epilogue* of the matmul. On an NPU this means the intermediate result
 never leaves the chip: it gets the bias and relu while it's still in the fast on-chip memory, instead of being
 written out to main memory and read back twice. For accelerator targets the optimizer also switches to 16-bit
-floats, and can optionally store weights as 8-bit integers.
+floats, and can optionally use 8-bit integers in one of two ways:
+
+- **int8 weights** (`quantize="int8"`): weights are stored as small integers plus one scale per output channel,
+  which halves the memory they take. The math is still done in 16-bit floats.
+- **int8 math** (`quantize="w8a8"`): the inputs to each matmul and convolution are rounded to integers too.
+  MIRA runs the program on a few sample inputs to learn how large each layer's values get (*calibration*), and
+  picks a scale so they fit between −127 and 127. Then the chip multiplies small integers, which is cheaper than
+  multiplying floats, and converts the sums back to real numbers at the end.
 
 ### 4. Deciding where things run: the partitioner
 
@@ -115,8 +122,8 @@ Each target gets the IR in its own form:
 
 - **CPU** runs every op with NumPy. It is the *reference*: every other backend is tested against it.
 - **Core ML** receives the program in MIL, Apple's own format; Core ML then decides which ops run on the Neural
-  Engine (Mira reports where each one landed).
-- **MLIR** is the industry-standard compiler framework. Mira writes standard MLIR, and
+  Engine (MIRA reports where each one landed).
+- **MLIR** is the industry-standard compiler framework. MIRA writes standard MLIR, and
   [IREE](https://iree.dev) compiles it to native code. Loops and branches compile onto the device here.
 - **MNPU-1** is a simulated NPU, and the one where you can see everything. Its code generator emits
   instructions like these:
@@ -167,14 +174,14 @@ A compiler that produces wrong numbers is worse than no compiler, so most of the
 - **Fuzzing.** Random, valid programs are generated and checked on every target, catching combinations no one
   would think to write by hand.
 - **Gradient checks.** Every differentiable operation's `grad()` is compared against finite differences.
-- **PyTorch parity.** PyTorch models are exported to ONNX, run through Mira, and compared with PyTorch itself.
+- **PyTorch parity.** PyTorch models are exported to ONNX, run through MIRA, and compared with PyTorch itself.
 - **Crash and regression tests** for every bug found, and **CI** that runs the suite on Linux x86 on every push.
 
 ## Bugs found along the way
 
-The tests didn't only find bugs in Mira. Several were in the tools Mira builds on:
+The tests didn't only find bugs in MIRA. Several were in the tools MIRA builds on:
 
-| where | what happened | Mira's workaround |
+| where | what happened | MIRA's workaround |
 |---|---|---|
 | Apple Core ML | an fp16 matmul with constant weights, followed directly by a transpose, gave wrong numbers | emit it as Core ML's `linear` op instead |
 | Apple Core ML | a few seconds after a prediction, Core ML freed NumPy input buffers on its own thread without Python's lock, crashing the interpreter | keep references to recent inputs so Core ML never frees the last one |
@@ -186,8 +193,12 @@ The tests didn't only find bugs in Mira. Several were in the tools Mira builds o
 
 - The Neural Engine is only reachable through Core ML, which makes the final decision about what runs on it.
 - MNPU-1's timing is a model of a chip that doesn't exist, not a measurement.
-- The ONNX importer covers common layers, but not yet grouped/depthwise convolutions or ONNX's own control-flow
-  ops.
+- IREE's CPU code for large convolutions is slow: ResNet-18 takes about 400 ms on the `mlir` target, versus
+  1.4 ms on the Neural Engine. For CNNs, use `coreml`.
+- The ONNX importer covers the layers in common vision models and transformers (including grouped and depthwise
+  convolutions and ONNX's `If`/`Loop`), but not every one of ONNX's ~190 operators.
+- There is no backend for AMD's or Intel's laptop NPUs yet. Their compilers (AMD's Ryzen AI / IREE-AMD-AIE, Intel's
+  OpenVINO) only run on Windows or Linux machines that have those chips.
 
 ## Where to look in the code
 

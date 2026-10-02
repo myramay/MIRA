@@ -1,4 +1,4 @@
-# A tiny GPT: one transformer block, trained and run entirely through Mira.
+# A tiny GPT: one transformer block, trained and run entirely through MIRA.
 #
 #   train_step  - loss and gradients for a batch of sequences (the host applies Adam)
 #   generate    - greedy decoding, one token per iteration of a data-dependent while

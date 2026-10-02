@@ -224,8 +224,13 @@ register("matmul", "matmul", _matmul_infer, _matmul_ref)
 
 # ---------------------------------------------------------------- conv2d (NCHW input, OIHW weight)
 
-def _conv_out(size, k, stride, pad):
-    return (size + 2 * pad - k) // stride + 1
+def _conv_out(size, k, stride, pad, dilation=1):
+    return (size + 2 * pad - dilation * (k - 1) - 1) // stride + 1
+
+
+def conv_params(a: dict):
+    """(stride, padding, dilation, groups) of a conv2d-family op, with defaults for older graphs."""
+    return tuple(a["stride"]), tuple(a["padding"]), tuple(a.get("dilation", (1, 1))), a.get("groups", 1)
 
 
 def _conv2d_infer(ts, a):
@@ -233,27 +238,42 @@ def _conv2d_infer(ts, a):
     dt = same_dtype([x, w], "conv2d")
     need_float([x], "conv2d")
     if x.rank != 4 or w.rank != 4:
-        raise OpTypeError(f"conv2d: expects input [N, C, H, W] and weight [O, C, KH, KW], got {x} and {w}")
+        raise OpTypeError(f"conv2d: expects input [N, C, H, W] and weight [O, C/groups, KH, KW], got {x} and {w}")
     n, c, h, wd = x.shape
     o, ci, kh, kw = w.shape
-    if c != ci:
-        raise OpTypeError(f"conv2d: input has {c} channels but weight expects {ci}")
-    (sh, sw), (ph, pw) = a["stride"], a["padding"]
-    oh, ow = _conv_out(h, kh, sh, ph), _conv_out(wd, kw, sw, pw)
+    (sh, sw), (ph, pw), (dh, dw), g = conv_params(a)
+    if g < 1 or c % g or o % g:
+        raise OpTypeError(f"conv2d: groups={g} must divide both the {c} input and {o} output channels")
+    if c != ci * g:
+        raise OpTypeError(f"conv2d: input has {c} channels but weight expects {ci} per group x {g} groups")
+    oh, ow = _conv_out(h, kh, sh, ph, dh), _conv_out(wd, kw, sw, pw, dw)
     if oh <= 0 or ow <= 0:
-        raise OpTypeError(f"conv2d: kernel {kh}x{kw} is larger than padded input {h}x{wd}")
+        raise OpTypeError(f"conv2d: kernel {kh}x{kw} (dilation {dh}x{dw}) is larger than padded input {h}x{wd}")
     core = TensorType(dt, (n, o, oh, ow))
     return epilogue_infer(core, ts, a.get("epilogue", ()), "conv2d")
 
 
+def _taps(x: np.ndarray, kh: int, kw: int, a: dict, oh: int, ow: int):
+    """Yield (i, j, x_tap) where x_tap[n, c, y, x] is the input pixel that kernel tap (i, j) sees."""
+    (sh, sw), (ph, pw), (dh, dw), _ = conv_params(a)
+    xp = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
+    for i in range(kh):
+        for j in range(kw):
+            yield i, j, xp[:, :, i * dh:i * dh + sh * (oh - 1) + 1:sh, j * dw:j * dw + sw * (ow - 1) + 1:sw]
+
+
 def _conv2d_ref(xs, a):
     x, w = f32(xs[0]), f32(xs[1])
-    (sh, sw), (ph, pw) = a["stride"], a["padding"]
-    x = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
-    kh, kw = w.shape[2:]
-    win = np.lib.stride_tricks.sliding_window_view(x, (kh, kw), axis=(2, 3))[:, :, ::sh, ::sw]
-    acc = np.einsum("nchwij,ocij->nohw", win, w, optimize=True)
-    return epilogue_ref(acc, xs, a.get("epilogue", ())).astype(xs[0].dtype)
+    g = a.get("groups", 1)
+    n, c = x.shape[:2]
+    o, cg, kh, kw = w.shape
+    out_t = _conv2d_infer([TensorType("f32", x.shape), TensorType("f32", w.shape)], {**a, "epilogue": ()})
+    oh, ow = out_t.shape[2:]
+    acc = np.zeros((n, g, o // g, oh, ow), np.float32)
+    wg = w.reshape(g, o // g, cg, kh, kw)
+    for i, j, xt in _taps(x, kh, kw, a, oh, ow):   # one small (grouped) matmul per kernel tap
+        acc += np.einsum("ngchw,goc->ngohw", xt.reshape(n, g, cg, oh, ow), wg[:, :, :, i, j], optimize=True)
+    return epilogue_ref(acc.reshape(n, o, oh, ow), xs, a.get("epilogue", ())).astype(xs[0].dtype)
 
 
 register("conv2d", "conv", _conv2d_infer, _conv2d_ref)
@@ -446,7 +466,8 @@ def _pad_infer(ts, a):
     return TensorType(x.dtype, tuple(d + lo + hi for d, (lo, hi) in zip(x.shape, pads)))
 
 
-register("pad", "shape", _pad_infer, lambda xs, a: np.pad(xs[0], a["pads"]))
+register("pad", "shape", _pad_infer,
+         lambda xs, a: np.pad(xs[0], a["pads"], constant_values=np.asarray(a.get("value", 0)).astype(xs[0].dtype)))
 
 
 # ---------------------------------------------------------------- integer indexing
@@ -568,6 +589,55 @@ def _dequant_ref(xs, a):
 register("dequantize", "const", lambda ts, a: TensorType(a["dtype"], tuple(a["q"].shape)), _dequant_ref)
 
 
+# ---------------------------------------------------------------- int8 compute (W8A8)
+#
+# qmatmul / qconv2d multiply in 8-bit integers. The weight is stored as int8 with one scale per output
+# channel (attrs q, w_scale); the activation x is quantized on the fly with a fixed per-tensor scale found
+# by calibration (attr x_scale):
+#     xq  = clip(round(x / x_scale), -127, 127)            int8
+#     acc = xq @ q                                         exact int32 sums
+#     y   = acc * x_scale * w_scale[out channel]           back to floating point, then the epilogue
+# inputs = [x, epilogue operands...]; epilogue operand indices refer to this list.
+
+def quantize_activation(x: np.ndarray, scale: float) -> np.ndarray:
+    return np.clip(np.round(f32(x) / np.float32(scale)), -127, 127)
+
+
+def _qmatmul_infer(ts, a):
+    x = ts[0]
+    need_float([x], "qmatmul")
+    k, n = a["q"].shape
+    if x.rank < 2 or x.shape[-1] != k:
+        raise OpTypeError(f"qmatmul: {x} doesn't match int8 weights of shape [{k}, {n}]")
+    core = TensorType(a["dtype"], x.shape[:-1] + (n,))
+    return epilogue_infer(core, ts, a.get("epilogue", ()), "qmatmul")
+
+
+def _qmatmul_ref(xs, a):
+    xq = quantize_activation(xs[0], a["x_scale"]).astype(np.int64)
+    acc = np.matmul(xq, a["q"].astype(np.int64)).astype(np.float64)
+    y = (acc * (np.float64(a["x_scale"]) * a["w_scale"].astype(np.float64))).astype(np.float32)
+    return epilogue_ref(y, xs, a.get("epilogue", ())).astype(NP_DTYPES[a["dtype"]])
+
+
+def _qconv2d_infer(ts, a):
+    x = ts[0]
+    need_float([x], "qconv2d")
+    core = _conv2d_infer([x, TensorType(x.dtype, tuple(a["q"].shape))], {**a, "epilogue": ()})
+    return epilogue_infer(core.with_dtype(a["dtype"]), ts, a.get("epilogue", ()), "qconv2d")
+
+
+def _qconv2d_ref(xs, a):
+    xq = quantize_activation(xs[0], a["x_scale"]).astype(np.float64)       # integer values, exact in float64
+    acc = _conv2d_ref([xq, a["q"].astype(np.float64)], {**a, "epilogue": ()}).astype(np.float64)
+    y = (acc * (np.float64(a["x_scale"]) * a["w_scale"].astype(np.float64)).reshape(1, -1, 1, 1)).astype(np.float32)
+    return epilogue_ref(y, xs, a.get("epilogue", ())).astype(NP_DTYPES[a["dtype"]])
+
+
+register("qmatmul", "matmul", _qmatmul_infer, _qmatmul_ref)
+register("qconv2d", "conv", _qconv2d_infer, _qconv2d_ref)
+
+
 # ---------------------------------------------------------------- gradient-only ops (created by autodiff)
 
 def _conv2d_grad_input_infer(ts, a):
@@ -577,14 +647,17 @@ def _conv2d_grad_input_infer(ts, a):
 def _conv2d_grad_input_ref(xs, a):
     """dL/dx for y = conv2d(x, w): scatter each output gradient back through the kernel."""
     g, w = f32(xs[0]), f32(xs[1])
-    (sh, sw), (ph, pw) = a["stride"], a["padding"]
+    (sh, sw), (ph, pw), (dh, dw), groups = conv_params(a)
     n, c, h, wd = a["in_shape"]
-    kh, kw = w.shape[2:]
+    o, cg, kh, kw = w.shape
     oh, ow = g.shape[2:]
+    gg = g.reshape(n, groups, o // groups, oh, ow)
+    wg = w.reshape(groups, o // groups, cg, kh, kw)
     dx = np.zeros((n, c, h + 2 * ph, wd + 2 * pw), np.float32)
     for i in range(kh):
         for j in range(kw):
-            dx[:, :, i:i + sh * oh:sh, j:j + sw * ow:sw] += np.einsum("nohw,oc->nchw", g, w[:, :, i, j])
+            contrib = np.einsum("ngohw,goc->ngchw", gg, wg[:, :, :, i, j], optimize=True).reshape(n, c, oh, ow)
+            dx[:, :, i * dh:i * dh + sh * (oh - 1) + 1:sh, j * dw:j * dw + sw * (ow - 1) + 1:sw] += contrib
     return dx[:, :, ph:ph + h, pw:pw + wd].astype(xs[0].dtype)
 
 
@@ -595,12 +668,15 @@ def _conv2d_grad_weight_infer(ts, a):
 def _conv2d_grad_weight_ref(xs, a):
     """dL/dw for y = conv2d(x, w): correlate the input windows with the output gradient."""
     x, g = f32(xs[0]), f32(xs[1])
-    (sh, sw), (ph, pw) = a["stride"], a["padding"]
-    kh, kw = a["w_shape"][2:]
-    x = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
-    win = np.lib.stride_tricks.sliding_window_view(x, (kh, kw), axis=(2, 3))[:, :, ::sh, ::sw]
-    win = win[:, :, :g.shape[2], :g.shape[3]]
-    return np.einsum("nohw,nchwij->ocij", g, win, optimize=True).astype(xs[0].dtype)
+    groups = a.get("groups", 1)
+    o, cg, kh, kw = a["w_shape"]
+    n = x.shape[0]
+    oh, ow = g.shape[2:]
+    gg = g.reshape(n, groups, o // groups, oh, ow)
+    dw = np.zeros((groups, o // groups, cg, kh, kw), np.float32)
+    for i, j, xt in _taps(x, kh, kw, a, oh, ow):
+        dw[:, :, :, i, j] = np.einsum("ngohw,ngchw->goc", gg, xt.reshape(n, groups, cg, oh, ow), optimize=True)
+    return dw.reshape(o, cg, kh, kw).astype(xs[0].dtype)
 
 
 def _maxpool2d_grad_ref(xs, a):
